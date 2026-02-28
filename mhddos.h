@@ -1,7 +1,7 @@
 #ifndef MHDDOS_H
 #define MHDDOS_H
 
-#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +26,7 @@
 #include <stdatomic.h>
 #include <math.h>
 #include <ctype.h>
-#include <uuid/uuid.h>
+
 
 #define VERSION "2.4 SNAPSHOT"
 #define MAX_THREADS 10000

