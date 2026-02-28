@@ -187,9 +187,9 @@ static void run_attack_in_child(int argc, char **argv) {
     setrlimit(RLIMIT_NOFILE, &rl);
 
     freopen("/tmp/mhddos_debug.log", "a", stderr);
+    setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "[CHILD PID %d] Starting attack, argc=%d\n", getpid(), argc);
     for (int i = 0; i < argc; i++) fprintf(stderr, "  argv[%d] = %s\n", i, argv[i]);
-    fflush(stderr);
 
     srand(time(NULL) ^ getpid());
     get_local_ip(g_local_ip, sizeof(g_local_ip));
