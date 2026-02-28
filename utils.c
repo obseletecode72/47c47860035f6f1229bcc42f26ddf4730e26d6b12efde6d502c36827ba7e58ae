@@ -26,6 +26,74 @@ void get_local_ip(char *buf, int buflen) {
     close(s);
 }
 
+int resolve_host(const char *hostname, char *ip_buf, int ip_buf_len) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, hostname, &addr) == 1) {
+        strncpy(ip_buf, hostname, ip_buf_len);
+        return 1;
+    }
+    uint8_t qbuf[512];
+    memset(qbuf, 0, sizeof(qbuf));
+    uint16_t txid = rand() & 0xFFFF;
+    qbuf[0] = (txid >> 8) & 0xFF;
+    qbuf[1] = txid & 0xFF;
+    qbuf[2] = 0x01; qbuf[3] = 0x00;
+    qbuf[4] = 0x00; qbuf[5] = 0x01;
+    qbuf[6] = 0x00; qbuf[7] = 0x00;
+    qbuf[8] = 0x00; qbuf[9] = 0x00;
+    qbuf[10] = 0x00; qbuf[11] = 0x00;
+    int pos = 12;
+    const char *p = hostname;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        int len = dot ? (int)(dot - p) : (int)strlen(p);
+        qbuf[pos++] = len;
+        memcpy(qbuf + pos, p, len);
+        pos += len;
+        if (dot) p = dot + 1;
+        else break;
+    }
+    qbuf[pos++] = 0;
+    qbuf[pos++] = 0x00; qbuf[pos++] = 0x01;
+    qbuf[pos++] = 0x00; qbuf[pos++] = 0x01;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+    struct timeval tv = {3, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in dns;
+    memset(&dns, 0, sizeof(dns));
+    dns.sin_family = AF_INET;
+    dns.sin_port = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &dns.sin_addr);
+    sendto(s, qbuf, pos, 0, (struct sockaddr*)&dns, sizeof(dns));
+    uint8_t rbuf[512];
+    int rlen = recv(s, rbuf, sizeof(rbuf), 0);
+    close(s);
+    if (rlen < 12) return 0;
+    int ancount = (rbuf[6] << 8) | rbuf[7];
+    if (ancount == 0) return 0;
+    int rpos = 12;
+    while (rpos < rlen && rbuf[rpos] != 0) {
+        rpos += rbuf[rpos] + 1;
+    }
+    rpos += 5;
+    for (int i = 0; i < ancount && rpos < rlen; i++) {
+        if ((rbuf[rpos] & 0xC0) == 0xC0) rpos += 2;
+        else { while (rpos < rlen && rbuf[rpos] != 0) rpos += rbuf[rpos] + 1; rpos++; }
+        if (rpos + 10 > rlen) return 0;
+        uint16_t rtype = (rbuf[rpos] << 8) | rbuf[rpos+1];
+        uint16_t rdlen = (rbuf[rpos+8] << 8) | rbuf[rpos+9];
+        rpos += 10;
+        if (rtype == 1 && rdlen == 4) {
+            snprintf(ip_buf, ip_buf_len, "%d.%d.%d.%d",
+                     rbuf[rpos], rbuf[rpos+1], rbuf[rpos+2], rbuf[rpos+3]);
+            return 1;
+        }
+        rpos += rdlen;
+    }
+    return 0;
+}
+
 void rand_bytes(uint8_t *buf, int len) {
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) { fread(buf, 1, len, f); fclose(f); }
@@ -43,6 +111,7 @@ void rand_ipv4(char *buf, int buflen) {
 }
 
 int rand_int(int min, int max) {
+    if (max <= min) return min;
     return min + rand() % (max - min + 1);
 }
 
@@ -129,37 +198,26 @@ void build_tcp_syn(uint8_t *packet, int *plen, const char *src_ip, const char *d
     struct iphdr *iph = (struct iphdr *)packet;
     struct tcphdr *tcph = (struct tcphdr *)(packet + sizeof(struct iphdr));
     int total_len = sizeof(struct iphdr) + sizeof(struct tcphdr);
-
     memset(packet, 0, total_len);
     build_ip_header(iph, src_ip, dst_ip, IPPROTO_TCP, total_len);
-
     tcph->source = htons(src_port);
     tcph->dest = htons(dst_port);
     tcph->seq = htonl(rand());
     tcph->ack_seq = 0;
     tcph->doff = 5;
     tcph->syn = 1;
-    tcph->fin = 0;
-    tcph->rst = 0;
-    tcph->psh = 0;
-    tcph->ack = 0;
-    tcph->urg = 0;
     tcph->window = htons(65535);
     tcph->check = 0;
-    tcph->urg_ptr = 0;
-
     struct pseudo_header psh;
     inet_pton(AF_INET, src_ip, &psh.src);
     inet_pton(AF_INET, dst_ip, &psh.dst);
     psh.placeholder = 0;
     psh.protocol = IPPROTO_TCP;
     psh.tcp_length = htons(sizeof(struct tcphdr));
-
     uint8_t pseudogram[sizeof(struct pseudo_header) + sizeof(struct tcphdr)];
     memcpy(pseudogram, &psh, sizeof(struct pseudo_header));
     memcpy(pseudogram + sizeof(struct pseudo_header), tcph, sizeof(struct tcphdr));
     tcph->check = ip_checksum(pseudogram, sizeof(pseudogram));
-
     iph->check = 0;
     iph->check = ip_checksum(iph, sizeof(struct iphdr));
     *plen = total_len;
@@ -169,10 +227,8 @@ void build_icmp_echo(uint8_t *packet, int *plen, const char *src_ip, const char 
     int icmp_len = sizeof(struct icmphdr) + data_len;
     int total_len = sizeof(struct iphdr) + icmp_len;
     memset(packet, 0, total_len);
-
     struct iphdr *iph = (struct iphdr *)packet;
     build_ip_header(iph, src_ip, dst_ip, IPPROTO_ICMP, total_len);
-
     struct icmphdr *icmph = (struct icmphdr *)(packet + sizeof(struct iphdr));
     icmph->type = ICMP_ECHO;
     icmph->code = 0;
@@ -181,7 +237,6 @@ void build_icmp_echo(uint8_t *packet, int *plen, const char *src_ip, const char 
     memset(packet + sizeof(struct iphdr) + sizeof(struct icmphdr), 'A', data_len);
     icmph->checksum = 0;
     icmph->checksum = ip_checksum(icmph, icmp_len);
-
     iph->check = 0;
     iph->check = ip_checksum(iph, sizeof(struct iphdr));
     *plen = total_len;
@@ -192,16 +247,13 @@ void build_udp_raw(uint8_t *packet, int *plen, const char *src_ip, const char *d
     int udp_len = sizeof(struct udphdr) + data_len;
     int total_len = sizeof(struct iphdr) + udp_len;
     memset(packet, 0, total_len);
-
     struct iphdr *iph = (struct iphdr *)packet;
     build_ip_header(iph, src_ip, dst_ip, IPPROTO_UDP, total_len);
-
     struct udphdr *udph = (struct udphdr *)(packet + sizeof(struct iphdr));
     udph->source = htons(src_port);
     udph->dest = htons(dst_port);
     udph->len = htons(udp_len);
     udph->check = 0;
-
     memcpy(packet + sizeof(struct iphdr) + sizeof(struct udphdr), data, data_len);
     *plen = total_len;
 }
@@ -257,7 +309,6 @@ int mc_handshake_forwarded(const char *host, int port, int version, int state,
     int pos = 0;
     pos += mc_varint(0x00, inner + pos);
     pos += mc_varint(version, inner + pos);
-
     uint8_t hostdata[1024];
     int hdpos = 0;
     memcpy(hostdata + hdpos, host, strlen(host)); hdpos += strlen(host);
@@ -265,11 +316,9 @@ int mc_handshake_forwarded(const char *host, int port, int version, int state,
     memcpy(hostdata + hdpos, ip, strlen(ip)); hdpos += strlen(ip);
     hostdata[hdpos++] = 0x00;
     memcpy(hostdata + hdpos, uuid_str, strlen(uuid_str)); hdpos += strlen(uuid_str);
-
     uint8_t wrapped[1024];
     int wlen = mc_data(hostdata, hdpos, wrapped);
     memcpy(inner + pos, wrapped, wlen); pos += wlen;
-
     pos += mc_short(port, inner + pos);
     pos += mc_varint(state, inner + pos);
     return mc_data(inner, pos, out);
@@ -335,8 +384,7 @@ void parse_url(const char *raw, url_t *u) {
     const char *colon = strchr(p, ':');
     if (colon && (!slash || colon < slash)) {
         strncpy(u->host, p, colon - p);
-        if (slash) u->port = atoi(colon + 1);
-        else u->port = atoi(colon + 1);
+        u->port = atoi(colon + 1);
     } else {
         if (slash) strncpy(u->host, p, slash - p);
         else strcpy(u->host, p);

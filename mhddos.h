@@ -1,7 +1,6 @@
 #ifndef MHDDOS_H
 #define MHDDOS_H
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,13 +19,10 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <math.h>
 #include <ctype.h>
-
 
 #define VERSION "2.4 SNAPSHOT"
 #define MAX_THREADS 10000
@@ -121,8 +117,8 @@ typedef struct {
     char **referers;
     int referer_count;
     volatile int *running;
-    SSL_CTX *ssl_ctx;
     char local_ip[64];
+    int use_ssl;
 } layer7_args_t;
 
 extern atomic_long REQUESTS_SENT;
@@ -226,7 +222,7 @@ void build_icmp_echo(uint8_t *packet, int *plen, const char *src_ip, const char 
 void build_udp_raw(uint8_t *packet, int *plen, const char *src_ip, const char *dst_ip, int src_port, int dst_port, const uint8_t *data, int data_len);
 
 int open_connection_l4(const char *ip, int port, proxy_t *proxies, int proxy_count);
-int open_connection_l7(layer7_args_t *args, SSL **ssl_out);
+int open_connection_l7(layer7_args_t *args);
 
 void generate_spoof_headers(char *buf, int buflen);
 void generate_l7_payload(layer7_args_t *args, const char *extra, char *buf, int buflen);
@@ -234,5 +230,6 @@ const char *get_method_type_str(method_t m);
 
 int load_lines(const char *path, char ***lines, int max_lines);
 int load_proxies(const char *path, proxy_t *proxies, int max_proxies, proxy_type_t type);
+int resolve_host(const char *hostname, char *ip_buf, int ip_buf_len);
 
 #endif

