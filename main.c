@@ -63,6 +63,11 @@ static int connect_to_server(const char *host, int port) {
         return -1;
     }
 
+    tv.tv_sec = 120;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
