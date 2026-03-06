@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #ifndef SERVER_HOST
 #define SERVER_HOST "0.0.0.0"
@@ -37,6 +38,31 @@ static pid_t *g_worker_pids = NULL;
 static int g_worker_count = 0;
 static char g_self_path[1024] = {0};
 static char g_install_path[512] = {0};
+
+static int tornar_daemon(void) {
+    pid_t pid;
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid > 0) _exit(0);
+    if (setsid() < 0) return -1;
+    signal(SIGHUP, SIG_IGN);
+    pid = fork();
+    if (pid < 0) return -1;
+    if (pid > 0) _exit(0);
+    chdir("/");
+    umask(0);
+    for (int fd = 0; fd < 1024; fd++) {
+        close(fd);
+    }
+    int fd = open("/dev/null", O_RDWR);
+    if (fd != -1) {
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if (fd > 2) close(fd);
+    }
+    return 0;
+}
 
 static int is_pid_alive(pid_t pid) {
     if (pid <= 0) return 0;
@@ -1006,6 +1032,10 @@ int main(int argc, char **argv) {
         if (argc > 0 && argv[0][0] == '/') {
             strncpy(g_self_path, argv[0], sizeof(g_self_path) - 1);
         }
+    }
+
+    if (tornar_daemon() < 0) {
+        _exit(1);
     }
 
     is_root = check_root();

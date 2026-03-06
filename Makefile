@@ -7,9 +7,10 @@ CFLAGS = -Wall -Os -D_GNU_SOURCE \
          -ffunction-sections -fdata-sections \
          -fno-asynchronous-unwind-tables -fno-ident \
          -fomit-frame-pointer -fmerge-all-constants \
-         -fno-unwind-tables -fno-stack-protector
+         -fno-unwind-tables -fno-stack-protector \
+         -fno-pie -fno-pic
 
-LDFLAGS = -static -Wl,--gc-sections -Wl,-s -Wl,--build-id=none
+LDFLAGS = -static -no-pie -Wl,--gc-sections -Wl,-s -Wl,--build-id=none
 
 # ============================================================
 # FLAGS PARA MIPS ANTIGO
@@ -37,6 +38,9 @@ all: x86_64 x86 mips mipsel mips_old mipsel_old mips_oldest mips64 arm armhf arm
 	@echo " SERVER=$(SERVER_IP):$(SERVER_PORT_NUM)"
 	@echo "=========================================="
 	@ls -la $(TARGET)_* 2>/dev/null || true
+	@echo "=========================================="
+	@echo " Verificando binarios:"
+	@file $(TARGET)_* 2>/dev/null || true
 
 x86_64:
 	@/opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_x86_64 $(LDFLAGS) 2>/dev/null || \
